@@ -1,0 +1,31 @@
+# Sandbox policy binding the ANS middleware. The sandboxed agent may call
+# tools.example.com; every allowed request leaves signed as payments-agent.
+version: 1
+
+network_middlewares:
+  ans-identity:
+    name: ANS identity
+    middleware: ans                 # the gateway registration name
+    order: 100                      # last in the chain: nothing may rewrite a signed request
+    on_error: fail_closed
+    endpoints:
+      include:
+        - tools.example.com
+    config:
+      mode: sign
+      identity: payments-agent      # an identity from the extension's service configuration
+      destination_policy: require_registered
+
+network_policies:
+  tools:
+    name: tools
+    endpoints:
+      - host: tools.example.com
+        port: 443
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /v1/tasks
+    binaries:
+      - path: /usr/bin/curl

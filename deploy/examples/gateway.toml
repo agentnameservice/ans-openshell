@@ -1,0 +1,40 @@
+# OpenShell gateway registration snippets for the ANS extension.
+# Merge into the gateway's TOML configuration. Replace hosts, paths and names.
+
+[[openshell.supervisor.middleware]]
+name = "ans"                                   # policies bind the middleware by this name
+grpc_endpoint = "https://ans-openshell-middleware.ans.svc:50051"
+tls_ca_cert_path = "/etc/openshell/ans-ca.pem"  # CA that issued the extension's serving certificate
+max_payload_bytes = 4194304                    # 4 MiB: the body is hashed into the proof, so the whole body is needed
+timeout = "500ms"
+# audience defaults to "urn:openshell:extension:middleware:ans"; it must equal auth.audience in the extension config.
+
+# failure_policy = "fail_closed" makes the interceptor a hard dependency of sandbox creation and
+# policy edits even when its destination_policy is "observe". Use "fail_open" where availability
+# matters more than vetting coverage; in require_registered mode keep it closed.
+[[openshell.gateway.interceptors]]
+name = "ans-destinations"
+grpc_endpoint = "https://ans-openshell-interceptor.ans.svc:50052"
+tls_ca_cert_path = "/etc/openshell/ans-ca.pem"
+order = 10
+failure_policy = "fail_closed"
+binding_policy = "allowlist"
+timeout = "2s"
+max_response_bytes = 1048576
+max_patches = 0
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/SubmitPolicyAnalysis"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/EditDraftChunk"
+phases = ["validate"]

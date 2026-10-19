@@ -1,0 +1,32 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      path: extension.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/extensionv1;extensionv1
+    - file_option: go_package
+      path: supervisor_middleware.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1;middlewarev1
+    - file_option: go_package
+      path: gateway_interceptor.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/interceptorv1;interceptorv1
+    - file_option: go_package
+      path: openshell.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/openshellv1;openshellv1
+    - file_option: go_package
+      path: sandbox.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/sandboxv1;sandboxv1
+    - file_option: go_package
+      path: datamodel.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/datamodelv1;datamodelv1
+    - file_option: go_package
+      path: options.proto
+      value: github.com/agentnameservice/ans-openshell/gen/openshell/optionsv1;optionsv1
+plugins:
+  - local: protoc-gen-go
+    out: .
+    opt: module=github.com/agentnameservice/ans-openshell
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=github.com/agentnameservice/ans-openshell

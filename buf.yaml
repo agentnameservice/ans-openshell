@@ -1,0 +1,9 @@
+version: v2
+modules:
+  - path: third_party/openshell/proto
+lint:
+  ignore:
+    - third_party/openshell/proto
+breaking:
+  use:
+    - FILE

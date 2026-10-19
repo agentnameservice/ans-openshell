@@ -1,0 +1,27 @@
+# ans-openshell-middleware --config middleware.yaml
+listen: ":50051"
+health_listen: ":8081"        # plaintext /healthz and /readyz for probes
+tls:
+  cert_file: /etc/ans-openshell/tls/tls.crt
+  key_file: /etc/ans-openshell/tls/tls.key
+auth:
+  gateway_issuer: openshell-gateway:prod-1
+  audience: urn:openshell:extension:middleware:ans
+  jwks_file: /etc/ans-openshell/gateway-jwks.json
+  jwks_url: https://openshell-gateway.openshell.svc/.well-known/jwks.json
+transparency_log:
+  base_url: https://tl.example.com
+  root_keys_file: /etc/ans-openshell/tl-root-keys.txt
+identities:
+  payments-agent:
+    ans_name: ans://v1.0.0.payments.example.com
+    agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
+    key_file: /var/run/secrets/ans-openshell/payments-agent/key.pem
+    cert_file: /var/run/secrets/ans-openshell/payments-agent/cert.pem
+# Approve gateway-issued sandbox IDs here; an empty map denies all signing.
+sandbox_identities: {}
+vetting:
+  trusted_tl_domains: [tl.example.com]
+  cache_ttl: 10m
+  request_budget: 150ms
+  exempt_hosts: ["api.openai.com", "*.amazonaws.com"]

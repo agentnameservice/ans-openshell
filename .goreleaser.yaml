@@ -1,0 +1,102 @@
+# GoReleaser config for the four ans-openshell binaries:
+#   ans-openshell-middleware   — OpenShell supervisor middleware (ANS-6 signing)
+#   ans-openshell-interceptor  — OpenShell gateway interceptor (destination vetting)
+#   ans-ocsf-hydrator          — OCSF audit export to Trust Index observations
+#   ans-reference-callee       — demo callee verifying ANS-6 Method B callers
+#
+# All four are pure Go; the release matrix is linux + darwin × amd64 + arm64.
+# Container images are built from deploy/Dockerfile and are not part of the
+# GoReleaser release.
+# Docs: https://goreleaser.com/customization/
+version: 2
+
+project_name: ans-openshell
+
+before:
+  hooks:
+    - go mod tidy
+
+# Each main declares `var version`; the Makefile and deploy/Dockerfile stamp
+# the same -X main.version target.
+builds:
+  - id: ans-openshell-middleware
+    main: ./cmd/ans-openshell-middleware
+    binary: ans-openshell-middleware
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+  - id: ans-openshell-interceptor
+    main: ./cmd/ans-openshell-interceptor
+    binary: ans-openshell-interceptor
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+  - id: ans-ocsf-hydrator
+    main: ./cmd/ans-ocsf-hydrator
+    binary: ans-ocsf-hydrator
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+  - id: ans-reference-callee
+    main: ./cmd/ans-reference-callee
+    binary: ans-reference-callee
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+# One archive per (goos, goarch), each containing all four binaries.
+archives:
+  - id: ans-openshell
+    ids:
+      - ans-openshell-middleware
+      - ans-openshell-interceptor
+      - ans-ocsf-hydrator
+      - ans-reference-callee
+    name_template: "ans-openshell_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - third_party/openshell/LICENSE
+      - third_party/openshell/README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+# release-please owns the changelog and the GitHub Release body. GoReleaser
+# only attaches binaries + checksums to the existing release.
+changelog:
+  disable: true
+
+release:
+  mode: append
+  # owner/name are intentionally omitted: GoReleaser infers them from the CI
+  # environment / git remote, so releases keep working across org renames and
+  # transfers.
