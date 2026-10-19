@@ -26,6 +26,8 @@ const (
 	methodEdit       = "EditDraftChunk"
 	methodImport     = "ImportProviderProfiles"
 	methodUpdate     = "UpdateProviderProfiles"
+	methodApprove    = "ApproveDraftChunk"
+	methodApproveAll = "ApproveAllDraftChunks"
 )
 
 type lookupCall struct {
@@ -130,12 +132,17 @@ func editDraftChunk(r *sandboxv1.NetworkPolicyRule) *openshellv1.EditDraftChunkR
 }
 
 func validateEval(method string, op *structpb.Struct) *interceptorv1.InterceptorEvaluation {
+	return validateEvalWithState(method, op, nil)
+}
+
+func validateEvalWithState(method string, op, state *structpb.Struct) *interceptorv1.InterceptorEvaluation {
 	return &interceptorv1.InterceptorEvaluation{
 		InterceptorName: "ans",
 		BindingId:       "test-binding",
 		Service:         openShellService,
 		Method:          method,
-		Phase:           &interceptorv1.InterceptorEvaluation_Validate{Validate: &interceptorv1.ValidateEvaluation{ProposedOperation: op}},
+		Phase: &interceptorv1.InterceptorEvaluation_Validate{Validate: &interceptorv1.ValidateEvaluation{
+			ProposedOperation: op, CurrentState: state}},
 	}
 }
 
@@ -178,4 +185,27 @@ func updateProviderProfiles(p *openshellv1.ProviderProfile) *openshellv1.UpdateP
 		req.Profile = &openshellv1.ProviderProfileImportItem{Profile: p}
 	}
 	return req
+}
+
+func approveDraftChunk(chunkID string) *openshellv1.ApproveDraftChunkRequest {
+	return &openshellv1.ApproveDraftChunkRequest{Sandbox: "sb-1", ChunkId: chunkID, ReviewToken: "tok-" + chunkID}
+}
+
+func approveAllDraftChunks(includeFlagged bool, chunkIDs ...string) *openshellv1.ApproveAllDraftChunksRequest {
+	req := &openshellv1.ApproveAllDraftChunksRequest{Sandbox: "sb-1", IncludeSecurityFlagged: includeFlagged}
+	for _, id := range chunkIDs {
+		req.Approvals = append(req.Approvals, &openshellv1.DraftChunkApproval{ChunkId: id, ReviewToken: "tok-" + id})
+	}
+	return req
+}
+
+func draftChunk(id, status, securityNotes string, r *sandboxv1.NetworkPolicyRule) *openshellv1.PolicyChunk {
+	return &openshellv1.PolicyChunk{Id: id, Status: status, RuleName: "rule-" + id, SecurityNotes: securityNotes, ProposedRule: r}
+}
+
+// draftState is the gateway state the approval bindings resolve stored drafts
+// from: the sandbox's draft policy in GetDraftPolicyResponse shape.
+func draftState(t *testing.T, chunks ...*openshellv1.PolicyChunk) *structpb.Struct {
+	t.Helper()
+	return toStruct(t, &openshellv1.GetDraftPolicyResponse{Chunks: chunks, DraftVersion: 3})
 }

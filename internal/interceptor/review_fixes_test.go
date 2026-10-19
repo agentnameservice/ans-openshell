@@ -34,7 +34,7 @@ func TestUpdateConfigHosts(t *testing.T) {
 			{Operation: &openshellv1.PolicyMergeOperation_RemoveRule{RemoveRule: &openshellv1.RemoveNetworkRule{RuleName: "old"}}},
 		},
 	}
-	hosts, err := updateConfigHosts(toStruct(t, req))
+	hosts, err := updateConfigHosts(toStruct(t, req), nil)
 	if err != nil {
 		t.Fatalf("updateConfigHosts() error = %v", err)
 	}
@@ -42,7 +42,7 @@ func TestUpdateConfigHosts(t *testing.T) {
 	if strings.Join(hosts, ",") != strings.Join(want, ",") {
 		t.Fatalf("updateConfigHosts() = %v, want %v", hosts, want)
 	}
-	if _, err := updateConfigHosts(nil); err == nil {
+	if _, err := updateConfigHosts(nil, nil); err == nil {
 		t.Fatal("updateConfigHosts(nil) = nil error")
 	}
 }
@@ -208,5 +208,60 @@ func TestEvaluateProviderProfilesAreVetted(t *testing.T) {
 				t.Fatalf("observe %s = %v, %v; want allowed with the unregistered endpoint annotated", tt.method, res, err)
 			}
 		})
+	}
+}
+
+func TestEvaluateDraftApprovals(t *testing.T) {
+	t.Parallel()
+	verdicts := map[string]vetting.Verdict{"evil.example.com": withStatus(vetting.StatusUnregistered), "crm.example.com": registered()}
+	stored := func(host string) *structpb.Struct {
+		return draftState(t, draftChunk("c1", "pending", "", rule(host)))
+	}
+	operations := map[string]*structpb.Struct{
+		methodApprove:    toStruct(t, approveDraftChunk("c1")),
+		methodApproveAll: toStruct(t, approveAllDraftChunks(false, "c1")),
+	}
+	tests := []struct {
+		name        string
+		mode        vetting.Mode
+		state       *structpb.Struct
+		wantAllowed bool
+		wantOutcome string
+		wantReason  string
+	}{
+		{name: "require denies an unregistered stored rule", mode: vetting.ModeRequire, state: stored("evil.example.com"), wantReason: "evil.example.com"},
+		{name: "require allows a registered stored rule", mode: vetting.ModeRequire, state: stored("crm.example.com"), wantAllowed: true},
+		{name: "require refuses an approval it cannot resolve", mode: vetting.ModeRequire, wantOutcome: "draft_unresolved", wantReason: "current_state"},
+		{name: "observe lets an unresolved approval through and records it", mode: vetting.ModeObserve, wantAllowed: true, wantOutcome: "draft_unresolved"},
+		{name: "require refuses state without draft chunks", mode: vetting.ModeRequire, state: mustStruct(t, map[string]any{"resourceVersion": "7"}), wantOutcome: "draft_unresolved", wantReason: "no draft chunks"},
+		{name: "require refuses an undecodable state", mode: vetting.ModeRequire, state: mustStruct(t, map[string]any{"chunks": "nope"}), wantOutcome: "draft_unresolved", wantReason: "current_state"},
+		{name: "observe lets an undecodable state through and records it", mode: vetting.ModeObserve, state: mustStruct(t, map[string]any{"chunks": "nope"}), wantAllowed: true, wantOutcome: "draft_unresolved"},
+	}
+	for method, op := range operations {
+		for _, tt := range tests {
+			t.Run(method+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				svc := NewService(&fakeVerifier{verdicts: verdicts}, Config{Mode: tt.mode}, discardLogger())
+				res, err := svc.Evaluate(t.Context(), validateEvalWithState(method, op, tt.state))
+				if err != nil {
+					t.Fatalf("Evaluate() error = %v", err)
+				}
+				if res.GetAllowed() != tt.wantAllowed {
+					t.Fatalf("allowed = %v, want %v (%v)", res.GetAllowed(), tt.wantAllowed, res)
+				}
+				if !tt.wantAllowed && res.GetStatusCode() != statusPermissionDenied {
+					t.Fatalf("status = %q, want %q", res.GetStatusCode(), statusPermissionDenied)
+				}
+				if tt.wantOutcome != "" && res.GetLogAnnotations()["ans.vetting"] != tt.wantOutcome {
+					t.Fatalf("outcome = %q, want %q", res.GetLogAnnotations()["ans.vetting"], tt.wantOutcome)
+				}
+				if got := res.GetLogAnnotations()["ans.vetting.denied"]; got != strconv.FormatBool(!tt.wantAllowed) {
+					t.Fatalf("denied annotation = %q, want %v", got, !tt.wantAllowed)
+				}
+				if tt.wantReason != "" && !strings.Contains(res.GetReason(), tt.wantReason) {
+					t.Fatalf("reason %q does not mention %q", res.GetReason(), tt.wantReason)
+				}
+			})
+		}
 	}
 }

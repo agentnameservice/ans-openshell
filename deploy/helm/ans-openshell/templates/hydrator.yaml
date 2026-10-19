@@ -26,6 +26,9 @@ spec:
             checksum/config: {{ toYaml .Values.hydrator.config | sha256sum }}
         spec:
           restartPolicy: Never
+{{- with .Values.hydrator.nodeSelector }}
+          nodeSelector: {{ toYaml . | nindent 12 }}
+{{- end }}
           securityContext:
             runAsNonRoot: true
             seccompProfile: {type: RuntimeDefault}
@@ -33,7 +36,15 @@ spec:
             - name: hydrator
               image: {{ include "ans-openshell.image" (dict "root" . "spec" .Values.hydrator) }}
               imagePullPolicy: {{ .Values.imagePullPolicy }}
-              args: ["--config", "/etc/ans-openshell/config.yaml", "--input", {{ .Values.hydrator.input | quote }}]
+              args:
+                - --config
+                - /etc/ans-openshell/config.yaml
+                - --input
+                - {{ .Values.hydrator.input | quote }}
+{{- with .Values.hydrator.window }}
+                - --window-last
+                - {{ . | quote }}
+{{- end }}
 {{- if .Values.hydrator.adminKeySecret }}
               envFrom:
                 - secretRef: {name: {{ .Values.hydrator.adminKeySecret }}}

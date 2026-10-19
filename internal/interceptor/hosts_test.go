@@ -1,7 +1,10 @@
 package interceptor
 
 import (
+	"errors"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -43,6 +46,8 @@ func TestNewBindings(t *testing.T) {
 		{"edit-draft-chunk", "openshell.v1.OpenShell/EditDraftChunk"},
 		{"import-provider-profiles", "openshell.v1.OpenShell/ImportProviderProfiles"},
 		{"update-provider-profiles", "openshell.v1.OpenShell/UpdateProviderProfiles"},
+		{"approve-draft-chunk", "openshell.v1.OpenShell/ApproveDraftChunk"},
+		{"approve-all-draft-chunks", "openshell.v1.OpenShell/ApproveAllDraftChunks"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("newBindings() returned %d bindings, want %d", len(got), len(want))
@@ -66,12 +71,20 @@ func TestExtractors(t *testing.T) {
 		t.Fatalf("no binding for %q", method)
 		return nil
 	}
+	pending := draftState(t,
+		draftChunk("c1", "pending", "", rule("a.example.com")),
+		draftChunk("c2", "pending", "resolves to a private range", rule("b.example.com")),
+		draftChunk("c3", "approved", "", rule("c.example.com")),
+	)
 	tests := []struct {
-		name    string
-		method  string
-		op      *structpb.Struct
-		want    []string
-		wantErr bool
+		name           string
+		method         string
+		op             *structpb.Struct
+		state          *structpb.Struct
+		want           []string
+		wantErr        bool
+		wantUnresolved bool
+		wantErrText    string
 	}{
 		{
 			name: "create sandbox collects every rule", method: methodCreate,
@@ -101,6 +114,23 @@ func TestExtractors(t *testing.T) {
 		{name: "update provider profile without payload", method: methodUpdate, op: toStruct(t, updateProviderProfiles(nil)), want: []string{}},
 		{name: "import provider profiles nil operation", method: methodImport, op: nil, wantErr: true},
 		{name: "update provider profile wrong field type", method: methodUpdate, op: mustStruct(t, map[string]any{"profile": "nope"}), wantErr: true},
+		{name: "approve draft chunk resolves the stored rule", method: methodApprove, op: toStruct(t, approveDraftChunk("c1")), state: pending, want: []string{"a.example.com"}},
+		{name: "approve draft chunk missing from state", method: methodApprove, op: toStruct(t, approveDraftChunk("c9")), state: pending, wantErr: true, wantUnresolved: true},
+		{name: "approve draft chunk without state", method: methodApprove, op: toStruct(t, approveDraftChunk("c1")), wantErr: true, wantUnresolved: true},
+		{name: "approve draft chunk wrong field type", method: methodApprove, op: mustStruct(t, map[string]any{"chunkId": 5}), state: pending, wantErr: true},
+		{name: "approve draft chunk undecodable state", method: methodApprove, op: toStruct(t, approveDraftChunk("c1")), state: mustStruct(t, map[string]any{"chunks": "nope"}), wantErr: true, wantUnresolved: true},
+		{name: "approve all explicit approvals", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false, "c1", "c3")), state: pending, want: []string{"a.example.com"}},
+		{name: "approve all explicit flagged chunk is skipped like the gateway does", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false, "c2")), state: pending, want: nil},
+		{name: "approve all explicit flagged chunk included on request", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(true, "c2")), state: pending, want: []string{"b.example.com"}},
+		{name: "approve all with many unknown chunk ids caps the diagnostic", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false, manyChunkIDs(12)...)), state: pending, wantErr: true, wantUnresolved: true, wantErrText: "(+2 more)"},
+		{name: "approve all against state without draft chunks", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false)), state: mustStruct(t, map[string]any{"resourceVersion": "7"}), wantErr: true, wantUnresolved: true},
+		{name: "approve all against an empty draft", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false)), state: mustStruct(t, map[string]any{"chunks": []any{}}), want: nil},
+		{name: "approve draft chunk that is already approved installs nothing", method: methodApprove, op: toStruct(t, approveDraftChunk("c3")), state: pending, want: nil},
+		{name: "approve all explicit approval missing from state", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false, "c1", "c9")), state: pending, wantErr: true, wantUnresolved: true},
+		{name: "approve all pending skips flagged chunks", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false)), state: pending, want: []string{"a.example.com"}},
+		{name: "approve all pending including flagged chunks", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(true)), state: pending, want: []string{"a.example.com", "b.example.com"}},
+		{name: "approve all without state", method: methodApproveAll, op: toStruct(t, approveAllDraftChunks(false)), wantErr: true, wantUnresolved: true},
+		{name: "approve all wrong field type", method: methodApproveAll, op: mustStruct(t, map[string]any{"approvals": "nope"}), state: pending, wantErr: true},
 		{name: "nil operation", method: methodCreate, op: nil, wantErr: true},
 		{name: "wrong field type", method: methodCreate, op: mustStruct(t, map[string]any{"spec": "nope"}), wantErr: true},
 		{name: "wrong nested type", method: methodSubmit, op: mustStruct(t, map[string]any{"proposedChunks": map[string]any{"a": 1}}), wantErr: true},
@@ -111,9 +141,15 @@ func TestExtractors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := extractor(tt.method)(tt.op)
+			got, err := extractor(tt.method)(tt.op, tt.state)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("extract() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if errors.Is(err, errDraftUnresolved) != tt.wantUnresolved {
+				t.Fatalf("extract() error = %v, want unresolved draft %v", err, tt.wantUnresolved)
+			}
+			if tt.wantErrText != "" && !strings.Contains(err.Error(), tt.wantErrText) {
+				t.Fatalf("extract() error = %v, want it to contain %q", err, tt.wantErrText)
 			}
 			slices.Sort(got)
 			if !tt.wantErr && !slices.Equal(got, tt.want) {
@@ -121,4 +157,12 @@ func TestExtractors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func manyChunkIDs(n int) []string {
+	ids := make([]string, 0, n)
+	for i := range n {
+		ids = append(ids, "missing-"+strconv.Itoa(i))
+	}
+	return ids
 }

@@ -50,13 +50,18 @@ type fileConfig struct {
 
 type flags struct {
 	configPath, input, windowStart, windowEnd string
+	windowLast                                time.Duration
 	dryRun, allowUnmapped                     bool
 }
 
-// errNothingAttributed reports an input whose events none of the configured
-// agents claimed: almost always mapping drift, so the job fails rather than
-// quietly starving the Trust Index.
-var errNothingAttributed = errors.New("events were parsed but none could be attributed to a configured agent (set --allow-unmapped to accept this)")
+// A run that yields nothing is usually misconfiguration rather than a quiet
+// period, so it fails instead of quietly starving the Trust Index: no events in
+// a non-empty input is the shape of a feed with ocsf_json_enabled off or a
+// collector wrapping the lines, and no attributed event at all is mapping drift.
+var (
+	errNoEvents          = errors.New("input had lines but no OCSF events; check that ocsf_json_enabled is set and that the collector writes bare lines (set --allow-unmapped to accept this)")
+	errNothingAttributed = errors.New("events were parsed but none of them mapped to a configured agent (set --allow-unmapped to accept this)")
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -70,9 +75,10 @@ func run() error {
 	flag.StringVar(&f.configPath, "config", "", "path to the YAML configuration (required)")
 	flag.StringVar(&f.input, "input", "-", "OCSF JSONL file, or - for stdin")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the import request instead of posting it")
-	flag.BoolVar(&f.allowUnmapped, "allow-unmapped", false, "exit 0 when events were parsed but none mapped to an agent")
+	flag.BoolVar(&f.allowUnmapped, "allow-unmapped", false, "exit 0 when the input yields no OCSF events or none of them map to an agent")
 	flag.StringVar(&f.windowStart, "window-start", "", "RFC 3339 start of the observation window (default: first event)")
 	flag.StringVar(&f.windowEnd, "window-end", "", "RFC 3339 end of the observation window (default: last event)")
+	flag.DurationVar(&f.windowLast, "window-last", 0, "aggregate only the trailing duration before now, e.g. 15m; an alternative to --window-start/--window-end")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	logFormat := flag.String("log-format", "json", "json or text")
 	showVer := flag.Bool("version", false, "print the version and exit")
@@ -109,11 +115,28 @@ func run() error {
 	defer closeInput()
 
 	report, err := hydrator.Run(ctx, in, sink, opts, logger)
-	logReport(ctx, logger, report, err)
+	logReport(ctx, logger, cfg.Agents, report, err)
 	if err != nil {
 		return err
 	}
-	if report.Parse.Events > 0 && report.Observations == 0 && !f.allowUnmapped {
+	if err := emptyRunError(report, f.allowUnmapped); err != nil {
+		logger.ErrorContext(ctx, "hydration rejected", "err", err)
+		return err
+	}
+	return nil
+}
+
+// emptyRunError decides whether a run that posted nothing is a failure. A
+// batch that did map but carried no network or HTTP activity is a quiet period
+// and succeeds without posting; so does one whose events all fell outside an
+// explicit window.
+func emptyRunError(report hydrator.Report, allowEmpty bool) error {
+	switch {
+	case allowEmpty:
+		return nil
+	case report.Parse.Lines > 0 && report.Parse.Events == 0:
+		return errNoEvents
+	case report.Unmapped > 0 && report.Attributed == 0:
 		return errNothingAttributed
 	}
 	return nil
@@ -138,14 +161,33 @@ func buildOptions(cfg fileConfig, f flags) (hydrator.Options, error) {
 	if opts.Signer, err = batchSigner(cfg); err != nil {
 		return hydrator.Options{}, err
 	}
-	if f.windowStart != "" || f.windowEnd != "" {
-		w, err := parseWindow(f.windowStart, f.windowEnd)
-		if err != nil {
-			return hydrator.Options{}, err
-		}
-		opts.Window = &w
+	if opts.Window, err = windowFlags(f, time.Now()); err != nil {
+		return hydrator.Options{}, err
 	}
 	return opts, nil
+}
+
+// windowFlags resolves the observation window: --window-last gives a trailing
+// window ending now, the shape a scheduled job wants, and the explicit pair
+// gives a fixed one.
+func windowFlags(f flags, now time.Time) (*hydrator.Window, error) {
+	explicit := f.windowStart != "" || f.windowEnd != ""
+	switch {
+	case f.windowLast < 0:
+		return nil, errors.New("--window-last must be positive")
+	case f.windowLast > 0 && explicit:
+		return nil, errors.New("--window-last cannot be combined with --window-start or --window-end")
+	case f.windowLast > 0:
+		now = now.UTC()
+		return &hydrator.Window{Start: now.Add(-f.windowLast), End: now}, nil
+	case explicit:
+		w, err := parseWindow(f.windowStart, f.windowEnd)
+		if err != nil {
+			return nil, err
+		}
+		return &w, nil
+	}
+	return nil, nil //nolint:nilnil // no window selects the span of the input
 }
 
 // signalConfig applies the optional signal id overrides; an empty id disables
@@ -243,17 +285,24 @@ func openInput(path string) (io.Reader, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
-func logReport(ctx context.Context, logger *slog.Logger, r hydrator.Report, runErr error) {
+func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.AgentMapping, r hydrator.Report, runErr error) {
 	if runErr != nil {
 		logger.ErrorContext(ctx, "hydration failed", "err", runErr)
 	}
 	logger.InfoContext(ctx, "hydration summary",
-		"lines", r.Parse.Lines, "events", r.Parse.Events, "skipped", r.Parse.Skipped,
+		"lines", r.Parse.Lines, "events", r.Parse.Events, "skipped", r.Parse.Skipped, "attributed", r.Attributed,
 		"unmapped", r.Unmapped, "no_container", r.NoContainer, "out_of_window", r.OutOfWindow,
 		"agents", len(r.Agents), "observations", r.Observations, "posted", r.Posted, "signed", r.Signed,
 		"window_start", r.Window.Start.Format(time.RFC3339), "window_end", r.Window.End.Format(time.RFC3339))
+	seen := make(map[string]bool, len(r.Agents))
 	for _, a := range r.Agents {
+		seen[a.AgentID] = true
 		logger.InfoContext(ctx, "agent summary", "agent_id", a.AgentID, "ans_name", a.AnsName,
 			"events", a.Events, "denied", a.Denied, "observations", a.Observations)
+	}
+	for _, m := range configured {
+		if !seen[m.AgentID] {
+			logger.WarnContext(ctx, "configured agent received no events", "agent_id", m.AgentID, "ans_name", m.AnsName)
+		}
 	}
 }

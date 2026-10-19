@@ -48,6 +48,9 @@ type AgentSummary struct {
 // Report describes one Run.
 type Report struct {
 	Parse ParseStats
+	// Attributed counts events that resolved to a configured agent and fell
+	// inside the window, whatever their class.
+	Attributed int
 	// Unmapped counts events that resolved to no agent; NoContainer is the
 	// subset that carried no container at all, as downgraded records do.
 	Unmapped    int
@@ -80,6 +83,7 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	err := consume(ctx, reader, agg)
 	report := Report{
 		Parse:       reader.Stats(),
+		Attributed:  agg.attributed,
 		Unmapped:    agg.unmapped,
 		NoContainer: agg.noContainer,
 		OutOfWindow: agg.outOfWindow,
@@ -94,6 +98,10 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	if report.Unmapped > 0 {
 		logger.WarnContext(ctx, "events without an agent mapping were skipped",
 			"unmapped", report.Unmapped, "no_container", report.NoContainer)
+	}
+	if report.Parse.Events > 0 && report.OutOfWindow == report.Parse.Events {
+		logger.WarnContext(ctx, "every event fell outside the window",
+			"events", report.Parse.Events, "window_start", report.Window.Start, "window_end", report.Window.End)
 	}
 	observations, err := buildObservations(agg, report.Window, opts, &report)
 	if err != nil {

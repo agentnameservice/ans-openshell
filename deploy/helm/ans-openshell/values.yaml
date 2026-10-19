@@ -70,15 +70,23 @@ interceptor:
       cache_ttl: 10m
       exempt_hosts: []
 
-# The hydrator runs as a CronJob over the gateway's OCSF JSONL. Mount the file with extraVolumes
-# and extraVolumeMounts (a hostPath or the gateway's log PVC) and point input at it.
+# The hydrator runs as a CronJob over the sandbox supervisors' OCSF records. Enable the export
+# with `openshell settings set --global --key ocsf_json_enabled --value true`; on Kubernetes have
+# the cluster's log collector keep the supervisor containers' OCSF-JSON stderr lines, written as
+# bare lines (not wrapped in the collector's own JSON), in a volume this job can read from any node
+# it may run on (or pin it with nodeSelector), mount it with extraVolumes and extraVolumeMounts and
+# point input at it. The hydrator signs and posts what it reads, so only the collector may write
+# that volume. The gateway's ocsf_log JSONL carries gateway-origin events only, not sandbox
+# traffic. Each run aggregates the trailing window, so keep window aligned with schedule.
 hydrator:
   enabled: false
   image:
     repository: ghcr.io/agentnameservice/ans-ocsf-hydrator
     tag: ""
   schedule: "*/15 * * * *"
-  input: /var/log/openshell/gateway-ocsf.jsonl
+  window: 15m          # --window-last; empty aggregates the whole input every run
+  input: /var/log/openshell/supervisor-ocsf.jsonl
+  nodeSelector: {}
   adminKeySecret: ""   # secret with key ANS_TRUST_INDEX_ADMIN_KEY; empty posts without Authorization
   extraVolumes: []
   extraVolumeMounts: []

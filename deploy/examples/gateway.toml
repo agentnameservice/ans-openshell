@@ -10,7 +10,9 @@ timeout = "500ms"
 # audience defaults to "urn:openshell:extension:middleware:ans"; it must equal auth.audience in the extension config.
 
 # failure_policy = "fail_closed" makes the interceptor a hard dependency of sandbox creation,
-# policy edits and custom provider-profile imports even when its destination_policy is "observe". Use "fail_open" where availability
+# policy edits, draft approvals and custom provider-profile imports even when its
+# destination_policy is "observe". Under require_registered a draft approval the interceptor
+# cannot resolve from current_state is refused. Use "fail_open" where availability
 # matters more than vetting coverage; in require_registered mode keep it closed.
 [[openshell.gateway.interceptors]]
 name = "ans-destinations"
@@ -45,4 +47,12 @@ phases = ["validate"]
 
 [[openshell.gateway.interceptors.bindings]]
 rpc = "openshell.v1.OpenShell/UpdateProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ApproveDraftChunk"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ApproveAllDraftChunks"
 phases = ["validate"]

@@ -100,6 +100,7 @@ func TestRunEndToEnd(t *testing.T) {
 	wantWindow := Window{Start: time.UnixMilli(sampleBaseMs + 1000).UTC(), End: time.UnixMilli(sampleBaseMs + 7000).UTC()}
 	want := Report{
 		Parse:        ParseStats{Lines: 10, Events: 7, Skipped: 3},
+		Attributed:   5,
 		Unmapped:     2,
 		NoContainer:  1,
 		Window:       wantWindow,
@@ -217,14 +218,27 @@ func TestRunWithoutObservations(t *testing.T) {
 			},
 		},
 		{
+			name:    "mapped process event under the default signals",
+			input:   `{"class_uid":1007,"container":{"uid":"sb"},"time":1000}` + "\n",
+			agents:  mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}),
+			signals: DefaultSignalConfig(),
+			wantReport: Report{
+				Parse:      ParseStats{Lines: 1, Events: 1},
+				Attributed: 1,
+				Window:     Window{Start: time.UnixMilli(1000).UTC(), End: time.UnixMilli(1000).UTC()},
+				Agents:     []AgentSummary{{AgentID: "a", Events: 1}},
+			},
+		},
+		{
 			name:    "no signals selected",
 			input:   `{"class_uid":4001,"container":{"uid":"sb"}}` + "\n",
 			agents:  mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}),
 			signals: SignalConfig{},
 			wantReport: Report{
-				Parse:  ParseStats{Lines: 1, Events: 1},
-				Window: Window{Start: fixedClock(), End: fixedClock()},
-				Agents: []AgentSummary{{AgentID: "a", Events: 1}},
+				Parse:      ParseStats{Lines: 1, Events: 1},
+				Attributed: 1,
+				Window:     Window{Start: fixedClock(), End: fixedClock()},
+				Agents:     []AgentSummary{{AgentID: "a", Events: 1}},
 			},
 		},
 	}
@@ -254,7 +268,7 @@ func TestRunMappedAgentWithoutObservationsStillSummarized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if report.Observations != 0 || report.Posted || len(report.Agents) != 1 || report.Agents[0].Events != 1 || report.Agents[0].Observations != 0 {
+	if report.Observations != 0 || report.Posted || report.Attributed != 1 || len(report.Agents) != 1 || report.Agents[0].Events != 1 || report.Agents[0].Observations != 0 {
 		t.Fatalf("Report = %+v", report)
 	}
 }
@@ -269,7 +283,7 @@ func TestRunExplicitWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if report.OutOfWindow != 4 || report.Unmapped != 0 || report.Window != window || report.Observations != 4 {
+	if report.OutOfWindow != 4 || report.Unmapped != 0 || report.Attributed != 3 || report.Window != window || report.Observations != 4 {
 		t.Fatalf("Report = %+v", report)
 	}
 	if report.Agents[0].Events != 1 || report.Agents[1].Events != 2 {
@@ -362,5 +376,23 @@ func TestRunFailures(t *testing.T) {
 				tt.check(t, report)
 			}
 		})
+	}
+}
+
+func TestRunWarnsWhenEveryEventIsOutsideTheWindow(t *testing.T) {
+	t.Parallel()
+	window := Window{Start: time.UnixMilli(sampleBaseMs + 60_000).UTC(), End: time.UnixMilli(sampleBaseMs + 120_000).UTC()}
+	var logs bytes.Buffer
+	sink := &fakeSink{}
+	opts := Options{Agents: sampleAgents(t), Signals: DefaultSignalConfig(), Window: &window, Clock: fixedClock}
+	report, err := Run(t.Context(), strings.NewReader(sampleInput(t)), sink, opts, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if report.OutOfWindow != report.Parse.Events || report.Attributed != 0 || len(sink.batches) != 0 {
+		t.Fatalf("Report = %+v, batches = %d", report, len(sink.batches))
+	}
+	if !strings.Contains(logs.String(), "every event fell outside the window") {
+		t.Fatalf("missing out-of-window warning:\n%s", logs.String())
 	}
 }

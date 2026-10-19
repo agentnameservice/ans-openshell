@@ -1,4 +1,7 @@
-# ans-ocsf-hydrator --config hydrator.yaml --input /var/log/openshell/gateway-ocsf.jsonl
+# ans-ocsf-hydrator --config hydrator.yaml --input /var/log/openshell/supervisor-ocsf.jsonl
+# The input is the collected supervisor feed (ocsf_json_enabled): raw OCSF-JSON stderr lines or
+# the supervisors' openshell-ocsf.*.jsonl files, one bare record per line (not wrapped in the
+# collector's own JSON). The gateway's ocsf_log JSONL carries gateway-origin events only.
 # Admin key: trust_index.admin_key_file, or the ANS_TRUST_INDEX_ADMIN_KEY environment variable.
 trust_index:
   base_url: https://trust-index.example.com

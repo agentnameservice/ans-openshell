@@ -100,6 +100,7 @@ type aggregator struct {
 	unmapped    int
 	noContainer int
 	outOfWindow int
+	attributed  int
 }
 
 func newAggregator(agents AgentMap, window *Window) *aggregator {
@@ -124,6 +125,7 @@ func (a *aggregator) add(ev Event) {
 		}
 		return
 	}
+	a.attributed++
 	st, seen := a.stats[mapping.AgentID]
 	if !seen {
 		st = newAgentStats(mapping)

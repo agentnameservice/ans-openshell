@@ -79,6 +79,8 @@ func checkManifest(t *testing.T, m *interceptorv1.InterceptorManifest) {
 		"edit-draft-chunk":         "openshell.v1.OpenShell/EditDraftChunk",
 		"import-provider-profiles": "openshell.v1.OpenShell/ImportProviderProfiles",
 		"update-provider-profiles": "openshell.v1.OpenShell/UpdateProviderProfiles",
+		"approve-draft-chunk":      "openshell.v1.OpenShell/ApproveDraftChunk",
+		"approve-all-draft-chunks": "openshell.v1.OpenShell/ApproveAllDraftChunks",
 	}
 	if len(m.GetBindings()) != len(want) {
 		t.Fatalf("bindings = %v, want %d", m.GetBindings(), len(want))

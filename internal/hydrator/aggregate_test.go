@@ -46,8 +46,8 @@ func TestAggregatorNetworkMath(t *testing.T) {
 	if got := st.rate(); got != 0.6 {
 		t.Fatalf("rate() = %v, want 0.6", got)
 	}
-	if agg.unmapped != 0 || agg.outOfWindow != 0 {
-		t.Fatalf("unmapped/outOfWindow = %d/%d", agg.unmapped, agg.outOfWindow)
+	if agg.unmapped != 0 || agg.outOfWindow != 0 || agg.attributed != 9 {
+		t.Fatalf("unmapped/outOfWindow/attributed = %d/%d/%d, want 0/0/9", agg.unmapped, agg.outOfWindow, agg.attributed)
 	}
 }
 
@@ -111,8 +111,8 @@ func TestAggregatorExplicitWindow(t *testing.T) {
 	for _, ms := range []int64{1000, 2000, 4000, 5000, 0} {
 		agg.add(netEvent(ClassNetworkActivity, "sb", false, "", "h", "", ms))
 	}
-	if agg.outOfWindow != 3 {
-		t.Fatalf("outOfWindow = %d, want 3", agg.outOfWindow)
+	if agg.outOfWindow != 3 || agg.attributed != 2 {
+		t.Fatalf("outOfWindow/attributed = %d/%d, want 3/2", agg.outOfWindow, agg.attributed)
 	}
 	if agg.stats["a"].total != 2 {
 		t.Fatalf("total = %d, want 2", agg.stats["a"].total)

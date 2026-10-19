@@ -5,6 +5,7 @@ package interceptor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -54,6 +55,9 @@ const (
 	outcomeVettingOff    = "vetting_off"
 	outcomeCallerDenied  = "caller_denied"
 	outcomeTooManyHosts  = "too_many_hosts"
+	// outcomeDraftUnresolved marks an approval whose stored rules the gateway
+	// did not supply in current_state.
+	outcomeDraftUnresolved = "draft_unresolved"
 )
 
 // Config selects the vetting policy the interceptor applies.
@@ -123,7 +127,8 @@ func (s *Service) Describe(ctx context.Context, req *interceptorv1.DescribeReque
 // Evaluate vets the hosts of a validate-phase operation. Other phases, unbound
 // methods and a service with vetting off are allowed untouched; an undecodable
 // operation is denied because the binding is fail-closed, and only the gateway
-// may evaluate.
+// may evaluate. A draft approval whose stored rules are not in current_state is
+// refused under require_registered and allowed with an annotation under observe.
 func (s *Service) Evaluate(ctx context.Context, req *interceptorv1.InterceptorEvaluation) (*interceptorv1.InterceptorResult, error) {
 	started := time.Now()
 	if c, ok := extauth.CallerFromContext(ctx); ok && c.Kind != extauth.CallerGateway {
@@ -145,7 +150,10 @@ func (s *Service) Evaluate(ctx context.Context, req *interceptorv1.InterceptorEv
 	if s.cfg.Mode == vetting.ModeOff {
 		return s.skipped(ctx, req, outcomeVettingOff), nil
 	}
-	hosts, err := b.extract(validate.GetProposedOperation())
+	hosts, err := b.extract(validate.GetProposedOperation(), validate.GetCurrentState())
+	if errors.Is(err, errDraftUnresolved) {
+		return s.draftUnresolved(ctx, req, err), nil
+	}
 	if err != nil {
 		s.logger.WarnContext(ctx, "denied undecodable operation",
 			"method", req.GetMethod(), "binding", req.GetBindingId(), "err", err)
@@ -194,6 +202,33 @@ func (s *Service) skipped(ctx context.Context, req *interceptorv1.InterceptorEva
 		Allowed:        true,
 		LogAnnotations: map[string]string{annotationOutcome: outcome},
 	}
+}
+
+// draftUnresolved handles an approval whose stored rules the gateway did not
+// supply: require_registered refuses to install destinations it has not seen,
+// observe lets the approval through and records the gap.
+func (s *Service) draftUnresolved(ctx context.Context, req *interceptorv1.InterceptorEvaluation, err error) *interceptorv1.InterceptorResult {
+	allowed := s.cfg.Mode != vetting.ModeRequire
+	level := slog.LevelWarn
+	if allowed {
+		level = slog.LevelInfo
+	}
+	s.logger.LogAttrs(ctx, level, "draft approval could not be vetted",
+		slog.String("method", req.GetMethod()), slog.String("binding", req.GetBindingId()),
+		slog.String("mode", s.cfg.Mode.String()), slog.String("err", err.Error()))
+	result := &interceptorv1.InterceptorResult{
+		Allowed: allowed,
+		LogAnnotations: map[string]string{
+			annotationMode:    s.cfg.Mode.String(),
+			annotationOutcome: outcomeDraftUnresolved,
+			annotationDenied:  strconv.FormatBool(!allowed),
+		},
+	}
+	if !result.GetAllowed() {
+		result.StatusCode = statusPermissionDenied
+		result.Reason = "ans destination vetting: " + err.Error()
+	}
+	return result
 }
 
 // binding selects the binding whose rpc selector names the evaluated

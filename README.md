@@ -64,11 +64,18 @@ configured address, `--log-level` (`debug`, `info`, `warn`, `error`), `--log-for
 ./bin/ans-openshell-interceptor --config deploy/examples/interceptor.yaml
 ```
 
-The hydrator is a batch job. It reads OCSF JSONL (or the supervisor's stderr with its
-`OCSF-JSON` lines) from `--input` or stdin, aggregates per agent and posts one batch:
+The hydrator is a batch job over the sandbox supervisors' OCSF records. Enable OpenShell's JSON
+export with `openshell settings set --global --key ocsf_json_enabled --value true`; each
+supervisor then writes one `OCSF-JSON` line per event to its stderr and, where its `/var/log` is
+writable, to `/var/log/openshell-ocsf.<date>.jsonl` inside the supervisor container. Collect
+either with your log pipeline into a file the hydrator can read, one bare line per record: it
+accepts raw supervisor stderr lines and plain JSONL, aggregates per agent and posts one batch.
+`--window-last 15m` restricts a scheduled run to the trailing window so it does not re-post the
+whole file. The gateway's own `ocsf_log` JSONL holds gateway-origin events only, not sandbox
+traffic, so it is not the input.
 
 ```bash
-./bin/ans-ocsf-hydrator --config deploy/examples/hydrator.yaml --input gateway-ocsf.jsonl
+./bin/ans-ocsf-hydrator --config deploy/examples/hydrator.yaml --input supervisor-ocsf.jsonl --window-last 15m
 ```
 
 `--dry-run` prints the import request instead of posting it; `--window-start` and
@@ -104,15 +111,23 @@ The reference callee takes flags only:
    is denied. Sandbox names and workspace labels cannot grant identity access.
 5. Optionally register the interceptor ([deploy/examples/interceptor.yaml](deploy/examples/interceptor.yaml))
    to vet hosts when sandboxes are created, policies are updated, custom provider profiles are
-   imported or updated, and Advisor proposals are submitted or edited. An operation naming more
-   than 64 destinations is denied under `require_registered`, so import large profile sets in
-   batches. Built-in provider profiles never pass through an interceptable RPC, so the interceptor
-   cannot vet their endpoints; the middleware still vets the destination of every signed request,
-   so under its `require_registered` list the built-in endpoints your sandboxes use in the
-   middleware's `vetting.exempt_hosts`, as exact hosts where possible: a `*.suffix` pattern exempts
-   every host under it.
-6. Ship the gateway's OCSF JSONL to the hydrator ([deploy/examples/hydrator.yaml](deploy/examples/hydrator.yaml))
-   on a schedule to feed the Trust Index. The signal ids it emits are configurable; the Trust
+   imported or updated, and Advisor proposals are submitted, edited or approved. An operation
+   naming more than 64 destinations is denied under `require_registered`, so import large profile
+   sets in batches. Approving a stored draft installs a rule the request does not carry, so the
+   interceptor resolves it from the gateway state attached to the evaluation (`current_state`,
+   which must carry the draft policy's `chunks`); the pinned OpenShell release does not populate
+   that state, so under `require_registered` draft approvals are refused until it does, while
+   `observe` allows and annotates them. Proposals are vetted when submitted or edited, so before
+   moving a gateway from `observe` to `require_registered` clear its pending drafts. Proposals the
+   gateway auto-approves (`proposal_approval_mode` auto) never pass through the approve RPCs and
+   are vetted at submission only. Built-in provider profiles never pass through an interceptable
+   RPC, so the interceptor cannot vet their endpoints; the middleware still vets the destination
+   of every signed request, so under its `require_registered` list the built-in endpoints your
+   sandboxes use in the middleware's `vetting.exempt_hosts`, as exact hosts where possible: a
+   `*.suffix` pattern exempts every host under it.
+6. Ship the collected supervisor OCSF feed to the hydrator ([deploy/examples/hydrator.yaml](deploy/examples/hydrator.yaml))
+   on a schedule to feed the Trust Index; the Helm chart's CronJob reads `hydrator.input` from a
+   volume your log collector writes. The signal ids it emits are configurable; the Trust
    Index must register them before it scores them.
 
 A Helm chart for both gRPC services is in [deploy/helm/ans-openshell](deploy/helm/ans-openshell)
