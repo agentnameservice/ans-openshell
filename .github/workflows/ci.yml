@@ -82,8 +82,7 @@ jobs:
       - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 #v1
         with:
           setup_only: true
-          # Pin the buf that generated gen/: buf releases change the formatting of
-          # generated doc comments, which this drift check would report.
+          # Pinned so the drift check is reproducible; make proto documents the plugin pins.
           version: 1.73.0
       - name: Install protoc plugins
         run: |

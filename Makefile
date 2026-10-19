@@ -13,8 +13,17 @@ build:
 	@mkdir -p $(BIN)
 	@for c in $(CMDS); do echo "building $$c"; $(GO) build -o $(BIN)/$$c ./cmd/$$c; done
 
+# Generated code must match CI byte for byte. protoc-gen-go formats its output with the
+# go/format of the toolchain that built it, so the plugins are built with the CI toolchain.
+PROTO_GOTOOLCHAIN ?= go1.26.9
+PROTOC_GEN_GO_VERSION := v1.36.12
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+
 proto:
-	buf generate
+	@mkdir -p $(BIN)
+	GOBIN=$(abspath $(BIN)) GOTOOLCHAIN=$(PROTO_GOTOOLCHAIN) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	GOBIN=$(abspath $(BIN)) GOTOOLCHAIN=$(PROTO_GOTOOLCHAIN) $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	PATH="$(abspath $(BIN)):$$PATH" buf generate
 
 test:
 	$(GO) test -race ./...
