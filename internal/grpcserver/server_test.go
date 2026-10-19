@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,7 @@ func TestServe_PlaintextHealthAndShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	s.SetHealthy(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx) }()
@@ -104,6 +106,7 @@ func TestServe_TLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	s.SetHealthy(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = s.Serve(ctx) }()
@@ -246,6 +249,7 @@ func TestServe_HealthEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	s.SetHealthy(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx) }()
@@ -308,17 +312,23 @@ func TestServe_DrainDelayReportsNotReadyFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.SetHealthy(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx) }()
 	base := "http://" + s.HealthAddr().String()
+	var code int
 	for range 50 {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/readyz", nil)
 		if resp, err := http.DefaultClient.Do(req); err == nil {
+			code = resp.StatusCode
 			_ = resp.Body.Close()
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("/readyz before the drain = %d, want 200", code)
 	}
 	started := time.Now()
 	cancel()
@@ -332,10 +342,93 @@ func TestServe_DrainDelayReportsNotReadyFirst(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz during drain = %d, want 503", resp.StatusCode)
 	}
+	s.SetHealthy(true)
+	if s.ready.Load() {
+		t.Fatal("SetHealthy(true) re-advertised readiness during the drain")
+	}
 	if err := <-done; err != nil {
 		t.Fatalf("Serve() error = %v", err)
 	}
 	if elapsed := time.Since(started); elapsed < 300*time.Millisecond {
 		t.Fatalf("Serve() returned after %v, before the drain delay", elapsed)
 	}
+}
+
+func TestNewStartsNotReady(t *testing.T) {
+	t.Parallel()
+	s, err := New(context.Background(), Options{Listen: "127.0.0.1:0"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.lis.Close()
+	if s.ready.Load() {
+		t.Fatal("New() reports ready before the owner asserted readiness")
+	}
+	resp, err := s.health.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	if err != nil || resp.GetStatus() != grpc_health_v1.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("health after New() = %v, %v; want NOT_SERVING", resp.GetStatus(), err)
+	}
+}
+
+func TestWatchReadiness(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		verdicts []bool
+		interval time.Duration
+		want     bool
+	}{
+		{name: "not ready is applied before the first tick", verdicts: []bool{false}, want: false},
+		{name: "ready is applied before the first tick", verdicts: []bool{true}, want: true},
+		{name: "recovery is applied on a tick", verdicts: []bool{false, true}, interval: 5 * time.Millisecond, want: true},
+		{name: "loss is applied on a tick", verdicts: []bool{true, false}, interval: 5 * time.Millisecond, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(context.Background(), Options{Listen: "127.0.0.1:0"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.lis.Close()
+			var calls atomic.Int32
+			probe := func() bool {
+				return tt.verdicts[min(int(calls.Add(1))-1, len(tt.verdicts)-1)]
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				s.WatchReadiness(ctx, tt.interval, probe)
+				close(done)
+			}()
+			if tt.interval == 0 {
+				<-done
+				if calls.Load() != 1 {
+					t.Fatalf("probe called %d times, want once without an interval", calls.Load())
+				}
+			} else {
+				waitUntil(t, "every scripted verdict to be applied", func() bool {
+					return int(calls.Load()) >= len(tt.verdicts) && s.ready.Load() == tt.want
+				})
+			}
+			if s.ready.Load() != tt.want {
+				t.Fatalf("ready = %v, want %v", s.ready.Load(), tt.want)
+			}
+			cancel()
+			<-done
+		})
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }

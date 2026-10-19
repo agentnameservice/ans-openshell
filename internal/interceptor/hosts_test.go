@@ -41,6 +41,8 @@ func TestNewBindings(t *testing.T) {
 		{"update-config", "openshell.v1.OpenShell/UpdateConfig"},
 		{"submit-policy-analysis", "openshell.v1.OpenShell/SubmitPolicyAnalysis"},
 		{"edit-draft-chunk", "openshell.v1.OpenShell/EditDraftChunk"},
+		{"import-provider-profiles", "openshell.v1.OpenShell/ImportProviderProfiles"},
+		{"update-provider-profiles", "openshell.v1.OpenShell/UpdateProviderProfiles"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("newBindings() returned %d bindings, want %d", len(got), len(want))
@@ -86,6 +88,19 @@ func TestExtractors(t *testing.T) {
 		},
 		{name: "edit draft chunk", method: methodEdit, op: toStruct(t, editDraftChunk(rule("new.example.com"))), want: []string{"new.example.com"}},
 		{name: "edit draft chunk without rule", method: methodEdit, op: toStruct(t, editDraftChunk(nil)), want: []string{}},
+		{
+			name: "import provider profiles collects every profile endpoint", method: methodImport,
+			op: toStruct(t, importProviderProfiles(
+				providerProfile("crm", endpoint("crm.example.com"), endpoint("api.example.com")),
+				providerProfile("metrics", &sandboxv1.NetworkEndpoint{AllowedIps: []string{"198.51.100.0/24"}, Port: 443}),
+			)),
+			want: []string{"198.51.100.0/24", "api.example.com", "crm.example.com"},
+		},
+		{name: "import provider profiles without profiles", method: methodImport, op: toStruct(t, importProviderProfiles()), want: nil},
+		{name: "update provider profile", method: methodUpdate, op: toStruct(t, updateProviderProfiles(providerProfile("crm", endpoint("new.example.com")))), want: []string{"new.example.com"}},
+		{name: "update provider profile without payload", method: methodUpdate, op: toStruct(t, updateProviderProfiles(nil)), want: []string{}},
+		{name: "import provider profiles nil operation", method: methodImport, op: nil, wantErr: true},
+		{name: "update provider profile wrong field type", method: methodUpdate, op: mustStruct(t, map[string]any{"profile": "nope"}), wantErr: true},
 		{name: "nil operation", method: methodCreate, op: nil, wantErr: true},
 		{name: "wrong field type", method: methodCreate, op: mustStruct(t, map[string]any{"spec": "nope"}), wantErr: true},
 		{name: "wrong nested type", method: methodSubmit, op: mustStruct(t, map[string]any{"proposedChunks": map[string]any{"a": 1}}), wantErr: true},

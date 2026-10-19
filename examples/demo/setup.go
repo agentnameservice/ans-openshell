@@ -191,6 +191,7 @@ func (d *demo) startMiddleware(ctx context.Context, dir, jwksFile string) error 
 	if err != nil {
 		return err
 	}
+	d.mw.SetHealthy(true)
 	authz, err := middleware.NewSandboxIdentities(map[string]string{sandboxID: identityKey}, d.registry)
 	if err != nil {
 		return err

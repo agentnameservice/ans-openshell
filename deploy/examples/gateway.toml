@@ -9,8 +9,8 @@ max_payload_bytes = 4194304                    # 4 MiB: the body is hashed into 
 timeout = "500ms"
 # audience defaults to "urn:openshell:extension:middleware:ans"; it must equal auth.audience in the extension config.
 
-# failure_policy = "fail_closed" makes the interceptor a hard dependency of sandbox creation and
-# policy edits even when its destination_policy is "observe". Use "fail_open" where availability
+# failure_policy = "fail_closed" makes the interceptor a hard dependency of sandbox creation,
+# policy edits and custom provider-profile imports even when its destination_policy is "observe". Use "fail_open" where availability
 # matters more than vetting coverage; in require_registered mode keep it closed.
 [[openshell.gateway.interceptors]]
 name = "ans-destinations"
@@ -37,4 +37,12 @@ phases = ["validate"]
 
 [[openshell.gateway.interceptors.bindings]]
 rpc = "openshell.v1.OpenShell/EditDraftChunk"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ImportProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateProviderProfiles"
 phases = ["validate"]

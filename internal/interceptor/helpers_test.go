@@ -24,6 +24,8 @@ const (
 	methodCreate     = "CreateSandbox"
 	methodSubmit     = "SubmitPolicyAnalysis"
 	methodEdit       = "EditDraftChunk"
+	methodImport     = "ImportProviderProfiles"
+	methodUpdate     = "UpdateProviderProfiles"
 )
 
 type lookupCall struct {
@@ -103,7 +105,7 @@ func mustStruct(t *testing.T, v map[string]any) *structpb.Struct {
 func rule(hosts ...string) *sandboxv1.NetworkPolicyRule {
 	endpoints := make([]*sandboxv1.NetworkEndpoint, 0, len(hosts))
 	for _, h := range hosts {
-		endpoints = append(endpoints, &sandboxv1.NetworkEndpoint{Host: h, Port: 443, Protocol: "rest"})
+		endpoints = append(endpoints, endpoint(h))
 	}
 	return &sandboxv1.NetworkPolicyRule{Name: "rule", Endpoints: endpoints}
 }
@@ -153,3 +155,27 @@ func gatewayPeer(major, minor uint32, required ...string) *extensionv1.PeerMetad
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+func endpoint(host string) *sandboxv1.NetworkEndpoint {
+	return &sandboxv1.NetworkEndpoint{Host: host, Port: 443, Protocol: "rest"}
+}
+
+func providerProfile(id string, endpoints ...*sandboxv1.NetworkEndpoint) *openshellv1.ProviderProfile {
+	return &openshellv1.ProviderProfile{Id: id, DisplayName: id, Endpoints: endpoints}
+}
+
+func importProviderProfiles(profiles ...*openshellv1.ProviderProfile) *openshellv1.ImportProviderProfilesRequest {
+	items := make([]*openshellv1.ProviderProfileImportItem, 0, len(profiles))
+	for _, p := range profiles {
+		items = append(items, &openshellv1.ProviderProfileImportItem{Profile: p, Source: p.GetId() + ".yaml"})
+	}
+	return &openshellv1.ImportProviderProfilesRequest{Profiles: items}
+}
+
+func updateProviderProfiles(p *openshellv1.ProviderProfile) *openshellv1.UpdateProviderProfilesRequest {
+	req := &openshellv1.UpdateProviderProfilesRequest{Id: p.GetId(), ExpectedResourceVersion: 1}
+	if p != nil {
+		req.Profile = &openshellv1.ProviderProfileImportItem{Profile: p}
+	}
+	return req
+}

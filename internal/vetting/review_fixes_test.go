@@ -32,13 +32,27 @@ func TestRefreshFailureKeepsValidVerdict(t *testing.T) {
 		t.Fatalf("initial Lookup = %+v, want registered", v)
 	}
 	h.dns.WithError("agent.example.com", errors.New("servfail"))
-	h.clock.Advance(9*time.Minute + 30*time.Second)
+	h.clock.Advance(9*time.Minute + 5*time.Second)
 	if v := svc.Lookup(t.Context(), "agent.example.com", 0); v.Status != StatusRegistered {
 		t.Fatalf("Lookup inside the refresh window = %+v, want the cached registered verdict", v)
 	}
 	eventually(t, "the failed refresh to be counted", func() bool { return svc.Stats().Errors == 1 })
-	if v := svc.Lookup(t.Context(), "agent.example.com", 5*time.Second); v.Status != StatusRegistered {
-		t.Fatalf("Lookup after a failed refresh = %+v, want the still-valid registered verdict", v)
+	lookups := svc.Stats().Lookups
+	h.clock.Advance(10 * time.Second)
+	for range 3 {
+		if v := svc.Lookup(t.Context(), "agent.example.com", 5*time.Second); v.Status != StatusRegistered {
+			t.Fatalf("Lookup after a failed refresh = %+v, want the still-valid registered verdict", v)
+		}
+	}
+	if got := svc.Stats().Lookups; got != lookups {
+		t.Fatalf("a failed refresh was retried %d times before the error TTL elapsed", got-lookups)
+	}
+	h.clock.Advance(defaultErrorTTL)
+	if v := svc.Lookup(t.Context(), "agent.example.com", 0); v.Status != StatusRegistered {
+		t.Fatalf("Lookup at the retry point = %+v, want the cached registered verdict", v)
+	}
+	if got := svc.Stats().Lookups; got != lookups+1 {
+		t.Fatalf("lookups after the error TTL = %d, want one retry (%d)", got, lookups+1)
 	}
 	h.clock.Advance(time.Minute)
 	if v := svc.Lookup(t.Context(), "agent.example.com", 5*time.Second); v.Status != StatusError {

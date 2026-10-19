@@ -73,10 +73,12 @@ func checkManifest(t *testing.T, m *interceptorv1.InterceptorManifest) {
 		t.Fatalf("capabilities = %v / %v", ext.GetSupportedCapabilities(), ext.GetRequiredCapabilities())
 	}
 	want := map[string]string{
-		"create-sandbox":         "openshell.v1.OpenShell/CreateSandbox",
-		"update-config":          "openshell.v1.OpenShell/UpdateConfig",
-		"submit-policy-analysis": "openshell.v1.OpenShell/SubmitPolicyAnalysis",
-		"edit-draft-chunk":       "openshell.v1.OpenShell/EditDraftChunk",
+		"create-sandbox":           "openshell.v1.OpenShell/CreateSandbox",
+		"update-config":            "openshell.v1.OpenShell/UpdateConfig",
+		"submit-policy-analysis":   "openshell.v1.OpenShell/SubmitPolicyAnalysis",
+		"edit-draft-chunk":         "openshell.v1.OpenShell/EditDraftChunk",
+		"import-provider-profiles": "openshell.v1.OpenShell/ImportProviderProfiles",
+		"update-provider-profiles": "openshell.v1.OpenShell/UpdateProviderProfiles",
 	}
 	if len(m.GetBindings()) != len(want) {
 		t.Fatalf("bindings = %v, want %d", m.GetBindings(), len(want))

@@ -32,7 +32,7 @@ const (
 	defaultHealthListen = ":8081"
 	defaultPolicy       = "observe"
 	drainDelay          = 3 * time.Second
-	healthCheckInterval = 15 * time.Second
+	healthCheckInterval = 5 * time.Second
 )
 
 type fileConfig struct {
@@ -92,17 +92,16 @@ func run() error {
 	if cfg.HealthListen == "" {
 		cfg.HealthListen = defaultHealthListen
 	}
-	if cfg.DestinationPolicy == "" {
-		cfg.DestinationPolicy = defaultPolicy
-	}
-	mode, err := vetting.ParseMode(cfg.DestinationPolicy)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return serve(ctx, cfg, logger)
+}
+
+func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
+	svcCfg, err := serviceConfig(cfg)
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	auth, err := extauth.NewVerifier(cfg.Auth, logger)
 	if err != nil {
 		return err
@@ -129,34 +128,59 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	svc := interceptor.NewService(vet, interceptor.Config{
+	svc := interceptor.NewService(vet, svcCfg, logger)
+	interceptorv1.RegisterGatewayInterceptorServer(srv.Registrar(), svc)
+	go srv.WatchReadiness(ctx, healthCheckInterval, readinessProbe(ctx, auth, logger))
+	logger.InfoContext(ctx, "ans-openshell-interceptor starting", "version", version, "mode", svcCfg.Mode.String())
+	return srv.Serve(ctx)
+}
+
+// serviceConfig maps the file configuration onto the interceptor service. The
+// destination policy defaults to observe. vetting.request_budget is a
+// middleware setting and is refused rather than silently ignored: the
+// interceptor bounds lookups with lookup_wait.
+func serviceConfig(cfg fileConfig) (interceptor.Config, error) {
+	if cfg.Vetting.RequestBudget != 0 {
+		return interceptor.Config{}, errors.New("vetting.request_budget applies to the middleware; the interceptor bounds lookups with lookup_wait")
+	}
+	if cfg.LookupWait < 0 {
+		return interceptor.Config{}, errors.New("lookup_wait must not be negative")
+	}
+	policy := cfg.DestinationPolicy
+	if policy == "" {
+		policy = defaultPolicy
+	}
+	mode, err := vetting.ParseMode(policy)
+	if err != nil {
+		return interceptor.Config{}, err
+	}
+	return interceptor.Config{
 		Audience:              cfg.Auth.Audience,
 		Mode:                  mode,
 		ImplementationVersion: version,
 		LookupWait:            cfg.LookupWait,
-	}, logger)
-	interceptorv1.RegisterGatewayInterceptorServer(srv.Registrar(), svc)
-	go watchHealth(ctx, srv, auth, logger)
-	logger.InfoContext(ctx, "ans-openshell-interceptor starting", "version", version, "mode", mode.String())
-	return srv.Serve(ctx)
+	}, nil
 }
 
-// watchHealth keeps readiness tied to the verifier holding a gateway key.
-func watchHealth(ctx context.Context, srv *grpcserver.Server, auth *extauth.Verifier, logger *slog.Logger) {
-	ticker := time.NewTicker(healthCheckInterval)
-	defer ticker.Stop()
-	ready := auth.Ready()
-	srv.SetHealthy(ready)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if now := auth.Ready(); now != ready {
-				ready = now
-				srv.SetHealthy(ready)
-				logger.WarnContext(ctx, "readiness changed", "ready", ready, "reason", "gateway verification keys")
+// keyHolder reports whether a gateway verification key is held;
+// extauth.Verifier satisfies it.
+type keyHolder interface{ Ready() bool }
+
+// readinessProbe ties readiness to the verifier holding a gateway key and logs
+// every change of state, the first evaluation included.
+func readinessProbe(ctx context.Context, auth keyHolder, logger *slog.Logger) func() bool {
+	var last *bool
+	return func() bool {
+		ready := auth.Ready()
+		if last == nil || *last != ready {
+			level := slog.LevelWarn
+			if ready {
+				level = slog.LevelInfo
 			}
+			logger.LogAttrs(ctx, level, "readiness evaluated",
+				slog.Bool("ready", ready), slog.String("reason", "gateway verification keys"))
 		}
+		last = &ready
+		return ready
 	}
 }

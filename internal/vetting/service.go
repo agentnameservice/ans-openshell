@@ -302,8 +302,9 @@ func (s *Service) run(ctx context.Context, fqdn models.Fqdn, f *flight) {
 
 // store caches v, releases the flight and returns the verdict to publish with
 // the status it replaced. A lookup that failed while a healthy verdict is still
-// unexpired does not replace it: a dependency blip during refresh-ahead must
-// not turn a registered host into a denial.
+// unexpired does not replace it, and the next refresh waits errorTTL: a
+// dependency blip during refresh-ahead must not turn a registered host into a
+// denial, and a failing dependency must not be retried on every cache hit.
 func (s *Service) store(host string, v Verdict) (Verdict, Status, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -317,6 +318,7 @@ func (s *Service) store(host string, v Verdict) (Verdict, Status, bool) {
 	if v.Status == StatusError {
 		s.stats.Errors++
 		if had && e.verdict.Status != StatusError && now.Before(e.expiresAt) {
+			e.refreshAt = now.Add(s.errorTTL)
 			return e.verdict, prev, had
 		}
 		s.cache.put(host, v, now, s.errorTTL)

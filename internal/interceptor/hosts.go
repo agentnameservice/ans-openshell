@@ -34,6 +34,8 @@ func newBindings() []binding {
 		newBinding("update-config", openshellv1.OpenShell_UpdateConfig_FullMethodName, updateConfigHosts),
 		newBinding("submit-policy-analysis", openshellv1.OpenShell_SubmitPolicyAnalysis_FullMethodName, submitPolicyAnalysisHosts),
 		newBinding("edit-draft-chunk", openshellv1.OpenShell_EditDraftChunk_FullMethodName, editDraftChunkHosts),
+		newBinding("import-provider-profiles", openshellv1.OpenShell_ImportProviderProfiles_FullMethodName, importProviderProfilesHosts),
+		newBinding("update-provider-profiles", openshellv1.OpenShell_UpdateProviderProfiles_FullMethodName, updateProviderProfilesHosts),
 	}
 }
 
@@ -92,11 +94,35 @@ func editDraftChunkHosts(op *structpb.Struct) ([]string, error) {
 	return ruleHosts(req.GetProposedRule()), nil
 }
 
-// ruleHosts lists every destination a rule admits. An endpoint without a host
-// admits whatever resolves into its allowed_ips, so those addresses stand in
-// for the host and are vetted as IP destinations.
-func ruleHosts(rule *sandboxv1.NetworkPolicyRule) []string {
-	endpoints := rule.GetEndpoints()
+// Provider profiles carry endpoints the gateway composes into every attached
+// sandbox's effective policy, so a custom profile admits destinations the same
+// way a policy rule does. Built-in profiles never pass through these RPCs.
+func importProviderProfilesHosts(op *structpb.Struct) ([]string, error) {
+	var req openshellv1.ImportProviderProfilesRequest
+	if err := decodeOperation(op, &req); err != nil {
+		return nil, err
+	}
+	var hosts []string
+	for _, item := range req.GetProfiles() {
+		hosts = append(hosts, endpointHosts(item.GetProfile().GetEndpoints())...)
+	}
+	return hosts, nil
+}
+
+func updateProviderProfilesHosts(op *structpb.Struct) ([]string, error) {
+	var req openshellv1.UpdateProviderProfilesRequest
+	if err := decodeOperation(op, &req); err != nil {
+		return nil, err
+	}
+	return endpointHosts(req.GetProfile().GetProfile().GetEndpoints()), nil
+}
+
+func ruleHosts(rule *sandboxv1.NetworkPolicyRule) []string { return endpointHosts(rule.GetEndpoints()) }
+
+// endpointHosts lists every destination a set of endpoints admits. An endpoint
+// without a host admits whatever resolves into its allowed_ips, so those
+// addresses stand in for the host and are vetted as IP destinations.
+func endpointHosts(endpoints []*sandboxv1.NetworkEndpoint) []string {
 	hosts := make([]string, 0, len(endpoints))
 	for _, ep := range endpoints {
 		if ep.GetHost() == "" {

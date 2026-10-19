@@ -32,7 +32,7 @@ var version = "dev"
 const (
 	defaultListen       = ":50051"
 	defaultHealthListen = ":8081"
-	healthCheckInterval = 30 * time.Second
+	healthCheckInterval = 5 * time.Second
 	drainDelay          = 3 * time.Second
 )
 
@@ -123,7 +123,6 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 	}
 
 	var vet vetting.Verifier
-	var vettingBudget time.Duration
 	if cfg.Vetting != nil {
 		vetSvc, vetErr := vetting.New(*cfg.Vetting, vetting.Deps{}, logger)
 		if vetErr != nil {
@@ -131,7 +130,6 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 		}
 		defer vetSvc.Close()
 		vet = vetSvc
-		vettingBudget = cfg.Vetting.RequestBudget
 	}
 
 	srv, err := grpcserver.New(ctx, grpcserver.Options{
@@ -145,44 +143,56 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	svc := middleware.NewService(registry, authz, vet, middleware.Config{
-		Audience:                   cfg.Auth.Audience,
-		MaxPayloadBytes:            cfg.MaxPayloadBytes,
-		RequestTimeout:             cfg.RequestTimeout,
-		ImplementationVersion:      version,
-		VettingBudget:              vettingBudget,
-		RequireAuthenticatedCaller: !cfg.Auth.AllowInsecureNoAuth,
-	}, logger)
+	svc := middleware.NewService(registry, authz, vet, serviceConfig(cfg), logger)
 	middlewarev1.RegisterSupervisorMiddlewareServer(srv.Registrar(), svc)
-	go watchHealth(ctx, srv, registry, auth, logger)
+	go srv.WatchReadiness(ctx, healthCheckInterval, readinessProbe(ctx, registry, auth, logger))
 	logger.InfoContext(ctx, "ans-openshell-middleware starting",
 		"version", version, "identities", registry.Names(), "vetting", vet != nil)
 	return srv.Serve(ctx)
 }
 
-// watchHealth keeps readiness tied to what the replica can actually do: it
-// must hold a gateway verification key and at least one identity with usable
+// serviceConfig maps the file configuration onto the middleware service.
+func serviceConfig(cfg fileConfig) middleware.Config {
+	c := middleware.Config{
+		Audience:                   cfg.Auth.Audience,
+		MaxPayloadBytes:            cfg.MaxPayloadBytes,
+		RequestTimeout:             cfg.RequestTimeout,
+		ImplementationVersion:      version,
+		RequireAuthenticatedCaller: !cfg.Auth.AllowInsecureNoAuth,
+	}
+	if cfg.Vetting != nil {
+		c.VettingBudget = cfg.Vetting.RequestBudget
+	}
+	return c
+}
+
+// keyHolder reports whether a gateway verification key is held;
+// extauth.Verifier satisfies it.
+type keyHolder interface{ Ready() bool }
+
+// identityHealth reports the configured identities and which of them lack
+// usable artifacts; identity.Registry satisfies it.
+type identityHealth interface {
+	Names() []string
+	Unhealthy() []string
+}
+
+// readinessProbe ties readiness to what the replica can actually do: it must
+// hold a gateway verification key and at least one identity with usable
 // artifacts. A single identity whose artifacts lapse is denied per request and
-// logged here, but does not take the other identities out of service.
-func watchHealth(ctx context.Context, srv *grpcserver.Server, registry *identity.Registry, auth *extauth.Verifier,
-	logger *slog.Logger) {
-	ticker := time.NewTicker(healthCheckInterval)
-	defer ticker.Stop()
-	state := healthState{}
-	for {
+// logged here, but does not take the other identities out of service. Every
+// change of state is logged, the first evaluation included.
+func readinessProbe(ctx context.Context, registry identityHealth, auth keyHolder, logger *slog.Logger) func() bool {
+	var last *healthState
+	return func() bool {
 		next := healthState{authReady: auth.Ready(), unhealthy: registry.Unhealthy(), total: len(registry.Names())}
-		if next.ready() != state.ready() || !slices.Equal(next.unhealthy, state.unhealthy) {
-			srv.SetHealthy(next.ready())
+		if last == nil || next.ready() != last.ready() || !slices.Equal(next.unhealthy, last.unhealthy) {
 			logger.LogAttrs(ctx, next.level(), "readiness evaluated",
 				slog.Bool("ready", next.ready()), slog.Bool("gateway_keys", next.authReady),
 				slog.Any("unhealthy_identities", next.unhealthy))
 		}
-		state = next
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+		last = &next
+		return next.ready()
 	}
 }
 

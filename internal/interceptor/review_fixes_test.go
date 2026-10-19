@@ -178,3 +178,35 @@ func callsWithin(got, want []lookupCall, tol time.Duration) bool {
 	}
 	return true
 }
+
+func TestEvaluateProviderProfilesAreVetted(t *testing.T) {
+	t.Parallel()
+	verdicts := map[string]vetting.Verdict{"evil.example.com": withStatus(vetting.StatusUnregistered), "crm.example.com": registered()}
+	tests := []struct {
+		name   string
+		method string
+		op     *structpb.Struct
+	}{
+		{name: "import", method: methodImport, op: toStruct(t, importProviderProfiles(
+			providerProfile("crm", endpoint("crm.example.com")), providerProfile("evil", endpoint("evil.example.com"))))},
+		{name: "update", method: methodUpdate, op: toStruct(t, updateProviderProfiles(providerProfile("crm", endpoint("evil.example.com"))))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require := NewService(&fakeVerifier{verdicts: verdicts}, Config{Mode: vetting.ModeRequire}, discardLogger())
+			res, err := require.Evaluate(t.Context(), validateEval(tt.method, tt.op))
+			if err != nil {
+				t.Fatalf("Evaluate() error = %v", err)
+			}
+			if res.GetAllowed() || res.GetStatusCode() != statusPermissionDenied || !strings.Contains(res.GetReason(), "evil.example.com") {
+				t.Fatalf("%s with an unregistered profile endpoint = %v, want a denial naming it", tt.method, res)
+			}
+			observe := NewService(&fakeVerifier{verdicts: verdicts}, Config{Mode: vetting.ModeObserve}, discardLogger())
+			res, err = observe.Evaluate(t.Context(), validateEval(tt.method, tt.op))
+			if err != nil || !res.GetAllowed() || !strings.Contains(res.GetLogAnnotations()["ans.vetting.verdicts"], "evil.example.com=unregistered") {
+				t.Fatalf("observe %s = %v, %v; want allowed with the unregistered endpoint annotated", tt.method, res, err)
+			}
+		})
+	}
+}

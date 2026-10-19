@@ -103,7 +103,14 @@ The reference callee takes flags only:
    Restart the service (or upgrade its Helm values) to apply the approval. Until then, signing
    is denied. Sandbox names and workspace labels cannot grant identity access.
 5. Optionally register the interceptor ([deploy/examples/interceptor.yaml](deploy/examples/interceptor.yaml))
-   to vet hosts when sandboxes are created, policies are updated, and Advisor proposals are submitted or edited.
+   to vet hosts when sandboxes are created, policies are updated, custom provider profiles are
+   imported or updated, and Advisor proposals are submitted or edited. An operation naming more
+   than 64 destinations is denied under `require_registered`, so import large profile sets in
+   batches. Built-in provider profiles never pass through an interceptable RPC, so the interceptor
+   cannot vet their endpoints; the middleware still vets the destination of every signed request,
+   so under its `require_registered` list the built-in endpoints your sandboxes use in the
+   middleware's `vetting.exempt_hosts`, as exact hosts where possible: a `*.suffix` pattern exempts
+   every host under it.
 6. Ship the gateway's OCSF JSONL to the hydrator ([deploy/examples/hydrator.yaml](deploy/examples/hydrator.yaml))
    on a schedule to feed the Trust Index. The signal ids it emits are configurable; the Trust
    Index must register them before it scores them.

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,8 @@ type Server struct {
 	lis       net.Listener
 	healthLis net.Listener
 	ready     atomic.Bool
+	mu        sync.Mutex
+	draining  bool
 	opts      Options
 	logger    *slog.Logger
 }
@@ -109,8 +112,8 @@ func New(ctx context.Context, opts Options, logger *slog.Logger) (*Server, error
 			return nil, fmt.Errorf("listen on health address %q: %w", opts.HealthListen, err)
 		}
 	}
-	s.ready.Store(true)
 	grpc_health_v1.RegisterHealthServer(s.grpc, s.health)
+	s.health.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	return s, nil
 }
 
@@ -130,14 +133,54 @@ func (s *Server) HealthAddr() net.Addr {
 }
 
 // SetHealthy flips the gRPC health service between SERVING and NOT_SERVING and
-// the HTTP /readyz endpoint between 200 and 503.
+// the HTTP /readyz endpoint between 200 and 503. A new server is not ready
+// until its owner says so, and once Serve starts draining it stays not ready.
+// Repeating the current state changes nothing, so health watchers only see
+// transitions.
 func (s *Server) SetHealthy(healthy bool) {
-	s.ready.Store(healthy)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if healthy && s.draining {
+		return
+	}
+	if s.ready.Swap(healthy) == healthy {
+		return
+	}
 	status := grpc_health_v1.HealthCheckResponse_NOT_SERVING
 	if healthy {
 		status = grpc_health_v1.HealthCheckResponse_SERVING
 	}
 	s.health.SetServingStatus("", status)
+}
+
+// drain takes readiness away for good: later SetHealthy(true) calls, such as
+// a readiness tick racing the shutdown, are ignored.
+func (s *Server) drain() {
+	s.mu.Lock()
+	s.draining = true
+	s.mu.Unlock()
+	s.SetHealthy(false)
+}
+
+// WatchReadiness applies probe's verdict immediately and then on every
+// interval until ctx ends, so a server is never reported ready before its owner
+// has checked that it can serve. A non-positive interval applies the probe once
+// and returns.
+func (s *Server) WatchReadiness(ctx context.Context, interval time.Duration, probe func() bool) {
+	s.SetHealthy(probe())
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.SetHealthy(probe())
+		}
+	}
 }
 
 func (s *Server) healthHandler() http.Handler {
@@ -185,7 +228,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	case <-ctx.Done():
 	}
-	s.SetHealthy(false)
+	s.drain()
 	s.health.Shutdown()
 	if s.opts.DrainDelay > 0 {
 		time.Sleep(s.opts.DrainDelay)

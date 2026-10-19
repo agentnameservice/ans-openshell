@@ -31,7 +31,7 @@ jobs:
           grep -v -e '/gen/' -e '/cmd/' -e '/examples/' coverage.out > coverage.lib.out
           COVERAGE=$(go tool cover -func=coverage.lib.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
           echo "library coverage: ${COVERAGE}%"
-          THRESHOLD=90
+          THRESHOLD=95
           if [ "$(echo "${COVERAGE} < ${THRESHOLD}" | bc -l)" -eq 1 ]; then
             echo "::error::Coverage ${COVERAGE}% is below the required ${THRESHOLD}% threshold"
             exit 1
