@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e #v7.0.0
         with:
           go-version: "1.26.9"
-      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 #v4.3.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 #v5.0.1
       - name: Build
         run: go build ./...
       - name: Test
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
       - name: Build image
         run: docker build -f deploy/Dockerfile --build-arg CMD=${{ matrix.cmd }} -t ${{ matrix.cmd }}:ci .
-      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 #v4.3.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 #v5.0.1
       - name: Lint and render chart
         run: |
           helm lint deploy/helm/ans-openshell
