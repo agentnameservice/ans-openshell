@@ -1,0 +1,561 @@
+package middleware
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"log/slog"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/agentnameservice/ans-sdk-go/pop"
+	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/agentnameservice/ans-openshell/gen/openshell/extensionv1"
+	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
+	"github.com/agentnameservice/ans-openshell/internal/extauth"
+	"github.com/agentnameservice/ans-openshell/internal/identity"
+	"github.com/agentnameservice/ans-openshell/internal/vetting"
+)
+
+const (
+	testIdentity = "payments-agent"
+	testAgentID  = "7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07"
+	testAnsName  = "ans://v1.0.0.payments.example.com"
+	testSandbox  = "sb-1"
+	receiptB64   = "cmVjZWlwdA=="
+	tokenB64     = "dG9rZW4="
+)
+
+const (
+	preCredentials = middlewarev1.SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS
+	preReturn      = middlewarev1.SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN
+	allow          = middlewarev1.Decision_DECISION_ALLOW
+	deny           = middlewarev1.Decision_DECISION_DENY
+)
+
+type signCall struct {
+	method, url string
+	digest      [sha256.Size]byte
+}
+
+// fakeSigner records calls and returns a numbered proof or a fixed error.
+type fakeSigner struct {
+	mu    sync.Mutex
+	err   error
+	calls []signCall
+}
+
+func (f *fakeSigner) Sign(_ context.Context, method, rawURL string, digest [sha256.Size]byte) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, signCall{method: method, url: rawURL, digest: digest})
+	if f.err != nil {
+		return "", f.err
+	}
+	return "proof-" + strconv.Itoa(len(f.calls)), nil
+}
+
+// fakeVerifier answers every lookup with one verdict and records the arguments.
+type fakeVerifier struct {
+	mu      sync.Mutex
+	verdict vetting.Verdict
+	hosts   []string
+	waits   []time.Duration
+}
+
+func (f *fakeVerifier) Lookup(_ context.Context, host string, wait time.Duration) vetting.Verdict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hosts = append(f.hosts, host)
+	f.waits = append(f.waits, wait)
+	v := f.verdict
+	v.Host = host
+	return v
+}
+
+type sandboxAuthorizer string
+
+func (a sandboxAuthorizer) Allows(sandboxID, _ string) bool {
+	return sandboxID == string(a)
+}
+
+type lookup map[string]*identity.Identity
+
+func (l lookup) Identity(name string) (*identity.Identity, bool) {
+	id, ok := l[name]
+	return id, ok
+}
+
+func newIdentity(t *testing.T, name string, signer identity.Signer, arts identity.Artifacts) *identity.Identity {
+	t.Helper()
+	id, err := identity.NewIdentity(name, testAnsName, testAgentID, signer, identity.NewStaticSource(arts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func fullArtifacts() identity.Artifacts {
+	return identity.Artifacts{ReceiptBase64: receiptB64, StatusTokenBase64: tokenB64}
+}
+
+// evaluation builds a PRE_CREDENTIALS request for a POST with the given policy.
+func evaluation(t *testing.T, policy map[string]any, body []byte) *middlewarev1.HttpRequestEvaluation {
+	t.Helper()
+	return &middlewarev1.HttpRequestEvaluation{
+		Phase:   preCredentials,
+		Context: &middlewarev1.RequestContext{RequestId: "req-1", SandboxId: testSandbox},
+		Config:  structOf(t, policy),
+		Target: &middlewarev1.HttpRequestTarget{
+			Scheme: "https", Host: "tools.example.com", Port: 443, Method: "POST", Path: "/v1/do", Query: "x=1",
+		},
+		Headers: []*middlewarev1.HttpHeader{{Name: "dpop", Value: "smuggled"}},
+		Body:    body,
+	}
+}
+
+func signPolicy() map[string]any { return map[string]any{"identity": testIdentity} }
+
+func TestNewServiceRequiresLookup(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewService(nil lookup) did not panic")
+		}
+	}()
+	NewService(nil, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+}
+
+func TestConfigDefaults(t *testing.T) {
+	t.Parallel()
+	s := NewService(lookup{}, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	if s.cfg.MaxPayloadBytes != DefaultMaxPayloadBytes || s.cfg.VettingBudget != DefaultVettingBudget {
+		t.Fatalf("defaults not applied: %+v", s.cfg)
+	}
+	custom := Config{MaxPayloadBytes: 1024, VettingBudget: time.Second, RequestTimeout: time.Second}
+	if got := NewService(lookup{}, sandboxAuthorizer(testSandbox), nil, custom, nil).cfg; got != custom {
+		t.Fatalf("explicit config changed: %+v", got)
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	t.Parallel()
+	v1 := &extensionv1.ProtocolVersion{Major: 1}
+	tests := []struct {
+		name     string
+		gateway  *extensionv1.PeerMetadata
+		wantCode codes.Code
+	}{
+		{name: "protocol 1.0", gateway: &extensionv1.PeerMetadata{ProtocolVersion: v1}},
+		{name: "protocol 1.3 with supported requirement", gateway: &extensionv1.PeerMetadata{
+			ProtocolVersion: &extensionv1.ProtocolVersion{Major: 1, Minor: 3}, RequiredCapabilities: []string{CapabilityContract}}},
+		{name: "no gateway metadata", gateway: nil, wantCode: codes.FailedPrecondition},
+		{name: "protocol 2.0", gateway: &extensionv1.PeerMetadata{ProtocolVersion: &extensionv1.ProtocolVersion{Major: 2}},
+			wantCode: codes.FailedPrecondition},
+		{name: "unsupported requirement", gateway: &extensionv1.PeerMetadata{
+			ProtocolVersion: v1, RequiredCapabilities: []string{CapabilityContract, "openshell.websocket"}},
+			wantCode: codes.FailedPrecondition},
+	}
+	cfg := Config{Audience: "urn:openshell:extension:middleware:ans", ImplementationVersion: "v0.1.0", RequestTimeout: 250 * time.Millisecond}
+	s := NewService(lookup{}, sandboxAuthorizer(testSandbox), nil, cfg, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := s.Describe(t.Context(), &middlewarev1.MiddlewareDescribeRequest{Gateway: tt.gateway})
+			if tt.wantCode != codes.OK {
+				if status.Code(err) != tt.wantCode {
+					t.Fatalf("Describe() error = %v, want code %v", err, tt.wantCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Describe() error = %v", err)
+			}
+			if m.GetName() != ManifestName || m.GetServiceVersion() != "v0.1.0" || m.GetExpectedAudience() != cfg.Audience {
+				t.Fatalf("manifest = %v", m)
+			}
+			ext := m.GetExtension()
+			if ext.GetProtocolVersion().GetMajor() != 1 || ext.GetProtocolVersion().GetMinor() != 0 ||
+				ext.GetImplementationName() != ImplementationName || ext.GetImplementationVersion() != "v0.1.0" ||
+				len(ext.GetSupportedCapabilities()) != 1 || ext.GetSupportedCapabilities()[0] != CapabilityContract {
+				t.Fatalf("extension metadata = %v", ext)
+			}
+			if len(m.GetBindings()) != 1 {
+				t.Fatalf("bindings = %v", m.GetBindings())
+			}
+			b := m.GetBindings()[0]
+			if b.GetOperation() != middlewarev1.SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST ||
+				b.GetPhase() != preCredentials || b.GetMaxPayloadBytes() != DefaultMaxPayloadBytes ||
+				b.GetRequestTimeout().AsDuration() != cfg.RequestTimeout {
+				t.Fatalf("binding = %v", b)
+			}
+		})
+	}
+	t.Run("no request timeout when unset", func(t *testing.T) {
+		t.Parallel()
+		m, err := NewService(lookup{}, sandboxAuthorizer(testSandbox), nil, Config{}, nil).Describe(t.Context(),
+			&middlewarev1.MiddlewareDescribeRequest{Gateway: &extensionv1.PeerMetadata{ProtocolVersion: v1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.GetBindings()[0].GetRequestTimeout() != nil {
+			t.Fatalf("request_timeout = %v, want unset", m.GetBindings()[0].GetRequestTimeout())
+		}
+	})
+}
+
+func TestValidateConfig(t *testing.T) {
+	t.Parallel()
+	ids := lookup{testIdentity: newIdentity(t, testIdentity, &fakeSigner{}, fullArtifacts())}
+	withVet := NewService(ids, sandboxAuthorizer(testSandbox), &fakeVerifier{}, Config{}, nil)
+	noVet := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	tests := []struct {
+		name    string
+		svc     *Service
+		policy  map[string]any
+		wantErr string
+	}{
+		{name: "sign known identity", svc: noVet, policy: signPolicy()},
+		{name: "strip", svc: noVet, policy: map[string]any{"mode": "strip"}},
+		{name: "observe with vetting", svc: withVet, policy: map[string]any{"identity": testIdentity, "destination_policy": "observe"}},
+		{name: "require with vetting", svc: withVet, policy: map[string]any{"mode": "strip", "destination_policy": "require_registered"}},
+		{name: "sign unknown identity", svc: noVet, policy: map[string]any{"identity": "ghost"}, wantErr: `unknown identity "ghost"`},
+		{name: "sign without identity", svc: noVet, policy: map[string]any{}, wantErr: "identity is required"},
+		{name: "strip with identity", svc: noVet, policy: map[string]any{"mode": "strip", "identity": testIdentity},
+			wantErr: "must not be set in strip mode"},
+		{name: "unknown key", svc: noVet, policy: map[string]any{"identity": testIdentity, "order": "100"}, wantErr: `unknown field "order"`},
+		{name: "bad mode", svc: noVet, policy: map[string]any{"mode": "verify"}, wantErr: "unknown mode"},
+		{name: "bad destination policy", svc: withVet, policy: map[string]any{"identity": testIdentity, "destination_policy": "block"},
+			wantErr: "unknown destination_policy"},
+		{name: "destination policy without vetting", svc: noVet,
+			policy: map[string]any{"identity": testIdentity, "destination_policy": "observe"}, wantErr: "not configured"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			resp, err := tt.svc.ValidateConfig(t.Context(), &middlewarev1.ValidateConfigRequest{
+				Config: structOf(t, tt.policy), MiddlewareName: "ans"})
+			if err != nil {
+				t.Fatalf("ValidateConfig() error = %v", err)
+			}
+			if tt.wantErr == "" {
+				if !resp.GetValid() || resp.GetReason() != "" {
+					t.Fatalf("ValidateConfig() = %v, want valid", resp)
+				}
+				return
+			}
+			if resp.GetValid() || !strings.Contains(resp.GetReason(), tt.wantErr) {
+				t.Fatalf("ValidateConfig() = %v, want invalid with %q", resp, tt.wantErr)
+			}
+		})
+	}
+	t.Run("absent config struct is a gRPC error", func(t *testing.T) {
+		t.Parallel()
+		_, err := noVet.ValidateConfig(t.Context(), &middlewarev1.ValidateConfigRequest{})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("ValidateConfig(nil config) error = %v, want InvalidArgument", err)
+		}
+	})
+}
+
+func TestEvaluateSignAttachesIdentity(t *testing.T) {
+	t.Parallel()
+	signer := &fakeSigner{}
+	ids := lookup{testIdentity: newIdentity(t, testIdentity, signer, fullArtifacts())}
+	var logs bytes.Buffer
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	body := []byte(`{"amount":1}`)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), body))
+	if err != nil {
+		t.Fatalf("EvaluateHttpRequest() error = %v", err)
+	}
+	if res.GetDecision() != allow || res.GetReasonCode() != "" || res.GetHasBody() {
+		t.Fatalf("result = %v", res)
+	}
+	wantWrites := map[string]string{pop.DPoPHeader: "proof-1", scitt.HeaderReceipt: receiptB64, scitt.HeaderStatusToken: tokenB64}
+	muts := res.GetHeaderMutations()
+	if len(muts) != len(wantWrites) {
+		t.Fatalf("mutations = %v", muts)
+	}
+	for i, name := range []string{pop.DPoPHeader, scitt.HeaderReceipt, scitt.HeaderStatusToken} {
+		w := muts[i].GetWrite()
+		if w.GetName() != name || w.GetValue() != wantWrites[name] ||
+			w.GetOnExisting() != middlewarev1.ExistingHeaderAction_EXISTING_HEADER_ACTION_OVERWRITE {
+			t.Fatalf("mutation %d = %v, want OVERWRITE %s", i, muts[i], name)
+		}
+	}
+	if len(res.GetFindings()) != 1 || res.GetFindings()[0].GetType() != FindingIdentityAttached ||
+		res.GetFindings()[0].GetCount() != 1 || res.GetFindings()[0].GetSeverity() != severityInfo {
+		t.Fatalf("findings = %v", res.GetFindings())
+	}
+	wantMeta := map[string]string{MetadataIdentity: testIdentity, MetadataAnsName: testAnsName, MetadataAgentID: testAgentID}
+	if got := res.GetMetadata(); len(got) != len(wantMeta) {
+		t.Fatalf("metadata = %v", got)
+	}
+	for k, v := range wantMeta {
+		if res.GetMetadata()[k] != v {
+			t.Errorf("metadata[%s] = %q, want %q", k, res.GetMetadata()[k], v)
+		}
+	}
+	if len(signer.calls) != 1 || signer.calls[0].method != "POST" ||
+		signer.calls[0].url != "https://tools.example.com/v1/do" || signer.calls[0].digest != sha256.Sum256(body) {
+		t.Fatalf("signer calls = %+v", signer.calls)
+	}
+	if out := logs.String(); !strings.Contains(out, "request signed") || strings.Contains(out, "proof-1") ||
+		strings.Contains(out, "amount") || strings.Contains(out, receiptB64) {
+		t.Fatalf("log output leaks header or body content or lacks the decision: %s", out)
+	}
+
+	t.Run("bodyless request binds the empty digest", func(t *testing.T) {
+		t.Parallel()
+		res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), nil))
+		if err != nil || res.GetDecision() != allow {
+			t.Fatalf("result = %v, %v", res, err)
+		}
+		signer.mu.Lock()
+		defer signer.mu.Unlock()
+		if last := signer.calls[len(signer.calls)-1]; last.digest != sha256.Sum256(nil) {
+			t.Fatalf("digest = %x, want empty-content digest", last.digest)
+		}
+	})
+}
+
+func TestEvaluateStrip(t *testing.T) {
+	t.Parallel()
+	signer := &fakeSigner{}
+	ids := lookup{testIdentity: newIdentity(t, testIdentity, signer, fullArtifacts())}
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, map[string]any{"mode": "strip"}, []byte("x")))
+	if err != nil || res.GetDecision() != allow {
+		t.Fatalf("result = %v, %v", res, err)
+	}
+	want := []string{pop.DPoPHeader, scitt.HeaderReceipt, scitt.HeaderStatusToken}
+	if len(res.GetHeaderMutations()) != len(want) {
+		t.Fatalf("mutations = %v", res.GetHeaderMutations())
+	}
+	for i, m := range res.GetHeaderMutations() {
+		if m.GetRemove().GetName() != want[i] || m.GetWrite() != nil {
+			t.Fatalf("mutation %d = %v, want remove %s", i, m, want[i])
+		}
+	}
+	if len(res.GetFindings()) != 1 || res.GetFindings()[0].GetType() != FindingIdentityStripped || len(res.GetMetadata()) != 0 {
+		t.Fatalf("findings = %v metadata = %v", res.GetFindings(), res.GetMetadata())
+	}
+	if len(signer.calls) != 0 {
+		t.Fatal("strip mode signed")
+	}
+}
+
+func TestEvaluateDenies(t *testing.T) {
+	t.Parallel()
+	okID := newIdentity(t, testIdentity, &fakeSigner{}, fullArtifacts())
+	noToken := newIdentity(t, "no-token", &fakeSigner{}, identity.Artifacts{ReceiptBase64: receiptB64})
+	noReceipt := newIdentity(t, "no-receipt", &fakeSigner{}, identity.Artifacts{StatusTokenBase64: tokenB64})
+	brokenSigner := newIdentity(t, "broken", &fakeSigner{err: errors.New("hsm offline")}, fullArtifacts())
+	ids := lookup{testIdentity: okID, "no-token": noToken, "no-receipt": noReceipt, "broken": brokenSigner}
+	supervisorOther := extauth.ContextWithCaller(t.Context(), extauth.Caller{Kind: extauth.CallerSupervisor, SandboxID: "sb-other"})
+
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		vet      vetting.Verifier
+		mutate   func(e *middlewarev1.HttpRequestEvaluation)
+		policy   map[string]any
+		wantCode string
+	}{
+		{name: "pre-return phase", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Phase = preReturn }, wantCode: ReasonUnsupportedPhase},
+		{name: "unspecified phase", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Phase = 0 }, wantCode: ReasonUnsupportedPhase},
+		{name: "supervisor for another sandbox", ctx: supervisorOther, wantCode: ReasonCallerSandboxMismatch},
+		{name: "absent config", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Config = nil }, wantCode: ReasonPolicyInvalid},
+		{name: "unknown policy key", policy: map[string]any{"identity": testIdentity, "extra": "x"}, wantCode: ReasonPolicyInvalid},
+		{name: "destination policy without vetting", policy: map[string]any{"identity": testIdentity, "destination_policy": "observe"},
+			wantCode: ReasonPolicyInvalid},
+		{name: "absent target", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Target = nil }, wantCode: ReasonTargetInvalid},
+		{name: "empty method", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Target.Method = "" }, wantCode: ReasonTargetInvalid},
+		{name: "unsupported scheme", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Target.Scheme = "ftp" }, wantCode: ReasonTargetInvalid},
+		{name: "empty host", mutate: func(e *middlewarev1.HttpRequestEvaluation) { e.Target.Host = "" }, wantCode: ReasonTargetInvalid},
+		{name: "unknown identity", policy: map[string]any{"identity": "ghost"}, wantCode: ReasonIdentityUnknown},
+		{name: "status token unavailable", policy: map[string]any{"identity": "no-token"}, wantCode: ReasonStatusTokenUnavailable},
+		{name: "receipt unavailable", policy: map[string]any{"identity": "no-receipt"}, wantCode: ReasonReceiptUnavailable},
+		{name: "signer failure", policy: map[string]any{"identity": "broken"}, wantCode: ReasonSignFailed},
+		{name: "unregistered destination under require", vet: &fakeVerifier{verdict: vetting.Verdict{Status: vetting.StatusUnregistered}},
+			policy: map[string]any{"identity": testIdentity, "destination_policy": "require_registered"}, wantCode: vetting.ReasonUnregistered},
+		{name: "revoked destination under require", vet: &fakeVerifier{verdict: vetting.Verdict{Status: vetting.StatusRevoked}},
+			policy: map[string]any{"mode": "strip", "destination_policy": "require_registered"}, wantCode: vetting.ReasonRevoked},
+		{name: "unknown destination under require", vet: &fakeVerifier{verdict: vetting.Verdict{Status: vetting.StatusUnknown}},
+			policy: map[string]any{"identity": testIdentity, "destination_policy": "require_registered"}, wantCode: vetting.ReasonUnverified},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := tt.ctx
+			if ctx == nil {
+				ctx = t.Context()
+			}
+			policy := tt.policy
+			if policy == nil {
+				policy = signPolicy()
+			}
+			e := evaluation(t, policy, []byte("body"))
+			if tt.mutate != nil {
+				tt.mutate(e)
+			}
+			s := NewService(ids, sandboxAuthorizer(testSandbox), tt.vet, Config{}, nil)
+			res, err := s.EvaluateHttpRequest(ctx, e)
+			if err != nil {
+				t.Fatalf("EvaluateHttpRequest() error = %v", err)
+			}
+			if res.GetDecision() != deny || res.GetReasonCode() != tt.wantCode || res.GetReason() == "" {
+				t.Fatalf("result = %v, want DENY %s with a reason", res, tt.wantCode)
+			}
+			if len(res.GetHeaderMutations()) != 0 {
+				t.Fatalf("DENY carries mutations: %v", res.GetHeaderMutations())
+			}
+		})
+	}
+}
+
+func TestEvaluateCallerBinding(t *testing.T) {
+	t.Parallel()
+	ids := lookup{testIdentity: newIdentity(t, testIdentity, &fakeSigner{}, fullArtifacts())}
+	tests := []struct {
+		name     string
+		caller   *extauth.Caller
+		require  bool
+		wantCode string
+	}{
+		{name: "unauthenticated in insecure mode"},
+		{name: "unauthenticated when authentication is required", require: true, wantCode: ReasonCallerUnauthenticated},
+		{name: "supervisor for this sandbox", caller: &extauth.Caller{Kind: extauth.CallerSupervisor, SandboxID: testSandbox}, require: true},
+		{name: "supervisor for another sandbox", caller: &extauth.Caller{Kind: extauth.CallerSupervisor, SandboxID: "sb-other"},
+			wantCode: ReasonCallerSandboxMismatch},
+		{name: "gateway", caller: &extauth.Caller{Kind: extauth.CallerGateway}, wantCode: ReasonCallerNotSupervisor},
+		{name: "unknown kind", caller: &extauth.Caller{Kind: "operator", SandboxID: testSandbox}, wantCode: ReasonCallerNotSupervisor},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			if tt.caller != nil {
+				ctx = extauth.ContextWithCaller(ctx, *tt.caller)
+			}
+			s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{RequireAuthenticatedCaller: tt.require}, nil)
+			res, err := s.EvaluateHttpRequest(ctx, evaluation(t, signPolicy(), nil))
+			if err != nil {
+				t.Fatalf("EvaluateHttpRequest() error = %v", err)
+			}
+			if tt.wantCode == "" {
+				if res.GetDecision() != allow {
+					t.Fatalf("result = %v, want ALLOW", res)
+				}
+				return
+			}
+			if res.GetDecision() != deny || res.GetReasonCode() != tt.wantCode {
+				t.Fatalf("result = %v, want DENY %s", res, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestEvaluateDestinationVetting(t *testing.T) {
+	t.Parallel()
+	ids := lookup{testIdentity: newIdentity(t, testIdentity, &fakeSigner{}, fullArtifacts())}
+	budget := 75 * time.Millisecond
+	tests := []struct {
+		name       string
+		status     vetting.Status
+		policy     string
+		wantWait   time.Duration
+		wantDeny   bool
+		confidence string
+		severity   string
+	}{
+		{name: "registered under require", status: vetting.StatusRegistered, policy: "require_registered", wantWait: budget,
+			confidence: confidenceHigh, severity: severityInfo},
+		{name: "exempt under require", status: vetting.StatusExempt, policy: "require_registered", wantWait: budget,
+			confidence: confidenceHigh, severity: severityInfo},
+		{name: "unregistered under observe", status: vetting.StatusUnregistered, policy: "observe", wantWait: 0,
+			confidence: confidenceHigh, severity: severityMedium},
+		{name: "untrusted tl under observe", status: vetting.StatusUntrustedTL, policy: "observe", wantWait: 0,
+			confidence: confidenceHigh, severity: severityMedium},
+		{name: "below threshold under observe", status: vetting.StatusBelowThreshold, policy: "observe", wantWait: 0,
+			confidence: confidenceHigh, severity: severityMedium},
+		{name: "error under observe", status: vetting.StatusError, policy: "observe", wantWait: 0,
+			confidence: confidenceLow, severity: severityLow},
+		{name: "unknown under observe", status: vetting.StatusUnknown, policy: "observe", wantWait: 0,
+			confidence: confidenceLow, severity: severityLow},
+		{name: "unregistered under require", status: vetting.StatusUnregistered, policy: "require_registered", wantWait: budget,
+			wantDeny: true, confidence: confidenceHigh, severity: severityMedium},
+		{name: "unmapped status", status: vetting.Status(99), policy: "observe", wantWait: 0,
+			confidence: confidenceHigh, severity: severityMedium},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			vet := &fakeVerifier{verdict: vetting.Verdict{Status: tt.status, Detail: "test"}}
+			s := NewService(ids, sandboxAuthorizer(testSandbox), vet, Config{VettingBudget: budget}, nil)
+			policy := map[string]any{"identity": testIdentity, "destination_policy": tt.policy}
+			res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, policy, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(vet.hosts) != 1 || vet.hosts[0] != "tools.example.com" || vet.waits[0] != tt.wantWait {
+				t.Fatalf("lookup args = %v %v, want host tools.example.com wait %v", vet.hosts, vet.waits, tt.wantWait)
+			}
+			wantType := FindingDestinationPrefix + tt.status.String()
+			var found *middlewarev1.Finding
+			for _, f := range res.GetFindings() {
+				if f.GetType() == wantType {
+					found = f
+				}
+			}
+			if found == nil || found.GetConfidence() != tt.confidence || found.GetSeverity() != tt.severity {
+				t.Fatalf("findings = %v, want %s %s/%s", res.GetFindings(), wantType, tt.confidence, tt.severity)
+			}
+			if res.GetMetadata()[MetadataDestinationStatus] != tt.status.String() {
+				t.Fatalf("metadata = %v", res.GetMetadata())
+			}
+			if tt.wantDeny {
+				if res.GetDecision() != deny || res.GetReasonCode() != vetting.ReasonUnregistered {
+					t.Fatalf("result = %v, want DENY %s", res, vetting.ReasonUnregistered)
+				}
+				return
+			}
+			if res.GetDecision() != allow || len(res.GetFindings()) != 2 || res.GetMetadata()[MetadataIdentity] != testIdentity {
+				t.Fatalf("result = %v, want ALLOW with identity and destination findings", res)
+			}
+		})
+	}
+}
+
+func TestReasonCodeGrammar(t *testing.T) {
+	t.Parallel()
+	grammar := regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	check := func(code string) {
+		if !grammar.MatchString(code) {
+			t.Errorf("%q does not match the reason_code grammar", code)
+		}
+	}
+	for _, code := range []string{
+		ReasonUnsupportedPhase, ReasonCallerUnauthenticated, ReasonCallerNotSupervisor, ReasonCallerSandboxMismatch,
+		ReasonPolicyInvalid, ReasonTargetInvalid, ReasonIdentityUnknown,
+		ReasonStatusTokenUnavailable, ReasonReceiptUnavailable, ReasonSignFailed,
+		vetting.ReasonUnregistered, vetting.ReasonRevoked, vetting.ReasonUntrustedTL, vetting.ReasonBelowThreshold, vetting.ReasonUnverified,
+		FindingIdentityAttached, FindingIdentityStripped,
+	} {
+		check(code)
+	}
+	for _, st := range []vetting.Status{vetting.StatusUnknown, vetting.StatusRegistered, vetting.StatusUnregistered, vetting.StatusRevoked,
+		vetting.StatusUntrustedTL, vetting.StatusBelowThreshold, vetting.StatusError, vetting.StatusExempt} {
+		check(FindingDestinationPrefix + st.String())
+	}
+}

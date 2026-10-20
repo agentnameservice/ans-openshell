@@ -1,0 +1,68 @@
+{{- if .Values.hydrator.enabled }}
+{{- $name := printf "%s-hydrator" .Release.Name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+data:
+  config.yaml: |
+{{ toYaml .Values.hydrator.config | indent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+spec:
+  schedule: {{ .Values.hydrator.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{ $name }}
+          annotations:
+            checksum/config: {{ toYaml .Values.hydrator.config | sha256sum }}
+        spec:
+          restartPolicy: Never
+{{- with .Values.hydrator.nodeSelector }}
+          nodeSelector: {{ toYaml . | nindent 12 }}
+{{- end }}
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: hydrator
+              image: {{ include "ans-openshell.image" (dict "root" . "spec" .Values.hydrator) }}
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              args:
+                - --config
+                - /etc/ans-openshell/config.yaml
+                - --input
+                - {{ .Values.hydrator.input | quote }}
+{{- with .Values.hydrator.window }}
+                - --window-last
+                - {{ . | quote }}
+{{- end }}
+{{- if .Values.hydrator.adminKeySecret }}
+              envFrom:
+                - secretRef: {name: {{ .Values.hydrator.adminKeySecret }}}
+{{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources: {{ toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - {name: config, mountPath: /etc/ans-openshell/config.yaml, subPath: config.yaml, readOnly: true}
+{{- with .Values.hydrator.extraVolumeMounts }}
+{{ toYaml . | indent 16 }}
+{{- end }}
+          volumes:
+            - name: config
+              configMap: {name: {{ $name }}}
+{{- with .Values.hydrator.extraVolumes }}
+{{ toYaml . | indent 12 }}
+{{- end }}
+{{- end }}

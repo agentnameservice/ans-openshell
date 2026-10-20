@@ -1,0 +1,16 @@
+# ans-openshell-interceptor --config interceptor.yaml
+listen: ":50052"
+health_listen: ":8081"        # plaintext /healthz and /readyz for probes
+tls:
+  cert_file: /etc/ans-openshell/tls/tls.crt
+  key_file: /etc/ans-openshell/tls/tls.key
+auth:
+  gateway_issuer: openshell-gateway:prod-1
+  audience: urn:openshell:extension:interceptor:ans-destinations
+  jwks_file: /etc/ans-openshell/gateway-jwks.json
+destination_policy: observe        # observe (default) | require_registered | off
+lookup_wait: 300ms                 # require_registered only; keep below the gateway registration timeout
+vetting:
+  trusted_tl_domains: [tl.example.com]
+  cache_ttl: 10m
+  exempt_hosts: ["api.openai.com", "*.amazonaws.com"]

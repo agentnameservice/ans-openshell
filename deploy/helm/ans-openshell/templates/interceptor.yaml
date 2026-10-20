@@ -1,0 +1,3 @@
+{{- if .Values.interceptor.enabled }}
+{{- include "ans-openshell.service" (dict "root" . "name" "interceptor" "spec" .Values.interceptor) }}
+{{- end }}

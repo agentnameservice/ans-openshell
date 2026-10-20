@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ans-openshell
+description: ANS identity, destination vetting and Trust Index feed for NVIDIA OpenShell
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

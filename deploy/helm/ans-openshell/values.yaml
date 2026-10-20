@@ -1,0 +1,111 @@
+imagePullPolicy: IfNotPresent
+
+# Serving certificate for both gRPC services; OpenShell pins its CA with tls_ca_cert_path.
+tls:
+  secretName: ans-openshell-tls      # keys tls.crt and tls.key
+
+# The gateway's JWKS (cold-start trust anchor) and the transparency log root keys. Rotating a key
+# in this ConfigMap requires a rollout restart; gateway.jwksURL lets the services pick up a rotated
+# gateway signing key on their own instead.
+trust:
+  configMapName: ans-openshell-trust # keys gateway-jwks.json and tl-root-keys.txt
+
+gateway:
+  # Rendered into both services' auth.jwks_url. Must be https; empty disables steady-state refresh.
+  jwksURL: https://openshell-gateway.openshell.svc/.well-known/jwks.json
+
+terminationGracePeriodSeconds: 30
+
+# Each service is its own image: deploy/Dockerfile builds one binary per CMD build argument.
+middleware:
+  enabled: true
+  image:
+    repository: ghcr.io/agentnameservice/ans-openshell-middleware
+    tag: ""            # defaults to the chart appVersion
+  replicas: 2
+  port: 50051
+  healthPort: 8081     # plaintext /healthz and /readyz for kubelet probes
+  # One secret per identity, mounted at /var/run/secrets/ans-openshell/<name>/{key.pem,cert.pem}
+  identitySecrets:
+    payments-agent: payments-agent-identity
+  config:
+    auth:
+      gateway_issuer: openshell-gateway:prod-1
+      audience: urn:openshell:extension:middleware:ans
+      jwks_file: /etc/ans-openshell/trust/gateway-jwks.json
+    transparency_log:
+      base_url: https://tl.example.com
+      root_keys_file: /etc/ans-openshell/trust/tl-root-keys.txt
+    identities:
+      payments-agent:
+        ans_name: ans://v1.0.0.payments.example.com
+        agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
+        key_file: /var/run/secrets/ans-openshell/payments-agent/key.pem
+        cert_file: /var/run/secrets/ans-openshell/payments-agent/cert.pem
+    # Approve gateway-issued sandbox IDs before enabling signed requests.
+    sandbox_identities: {}
+    vetting:
+      trusted_tl_domains: [tl.example.com]
+      cache_ttl: 10m
+      request_budget: 150ms
+      exempt_hosts: []
+
+interceptor:
+  enabled: true
+  image:
+    repository: ghcr.io/agentnameservice/ans-openshell-interceptor
+    tag: ""
+  replicas: 2
+  port: 50052
+  healthPort: 8081
+  config:
+    auth:
+      gateway_issuer: openshell-gateway:prod-1
+      audience: urn:openshell:extension:interceptor:ans-destinations
+      jwks_file: /etc/ans-openshell/trust/gateway-jwks.json
+    destination_policy: observe   # observe | require_registered | off
+    lookup_wait: 300ms            # keep below the registration timeout in gateway.toml
+    vetting:
+      trusted_tl_domains: [tl.example.com]
+      cache_ttl: 10m
+      exempt_hosts: []
+
+# The hydrator runs as a CronJob over the sandbox supervisors' OCSF records. Enable the export
+# with `openshell settings set --global --key ocsf_json_enabled --value true`; on Kubernetes have
+# the cluster's log collector keep the supervisor containers' OCSF-JSON stderr lines, written as
+# bare lines (not wrapped in the collector's own JSON), in a volume this job can read from any node
+# it may run on (or pin it with nodeSelector), mount it with extraVolumes and extraVolumeMounts and
+# point input at it. The hydrator signs and posts what it reads, so only the collector may write
+# that volume. The gateway's ocsf_log JSONL carries gateway-origin events only, not sandbox
+# traffic. Each run aggregates the trailing window, so keep window aligned with schedule.
+hydrator:
+  enabled: false
+  image:
+    repository: ghcr.io/agentnameservice/ans-ocsf-hydrator
+    tag: ""
+  schedule: "*/15 * * * *"
+  window: 15m          # --window-last; empty aggregates the whole input every run
+  input: /var/log/openshell/supervisor-ocsf.jsonl
+  nodeSelector: {}
+  adminKeySecret: ""   # secret with key ANS_TRUST_INDEX_ADMIN_KEY; empty posts without Authorization
+  extraVolumes: []
+  extraVolumeMounts: []
+  config:
+    trust_index:
+      base_url: https://trust-index.example.com
+    provenance:
+      aim_id: ans://v1.0.0.platform.example.com
+    agents:
+      - agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
+        ans_name: ans://v1.0.0.payments.example.com
+        sandbox_names: [payments]
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# A middleware call holds up to 4 MiB of request body plus an 8 MiB gRPC message buffer, so
+# size memory for the expected number of concurrent in-flight requests.
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: "1", memory: 512Mi}

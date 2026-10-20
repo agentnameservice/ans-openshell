@@ -1,0 +1,22 @@
+# ans-ocsf-hydrator --config hydrator.yaml --input /var/log/openshell/supervisor-ocsf.jsonl
+# The input is the collected supervisor feed (ocsf_json_enabled): raw OCSF-JSON stderr lines or
+# the supervisors' openshell-ocsf.*.jsonl files, one bare record per line (not wrapped in the
+# collector's own JSON). The gateway's ocsf_log JSONL carries gateway-origin events only.
+# Admin key: trust_index.admin_key_file, or the ANS_TRUST_INDEX_ADMIN_KEY environment variable.
+trust_index:
+  base_url: https://trust-index.example.com
+  admin_key_file: /var/run/secrets/ans-openshell/trust-index-admin-key
+provenance:
+  aim_id: ans://v1.0.0.platform.example.com   # the operator's identity, recorded as provenance.aimId
+  evidence_url: https://ops.example.com/openshell/audit
+signals:
+  policy_violation_rate: openshell.policyViolationRate   # set to "" to disable
+  protocol_adherence: openshell.protocolAdherence
+signing:                                                 # optional; signs each batch (X-Ans-Batch-Signature)
+  key_file: /var/run/secrets/ans-openshell/platform/key.pem
+  cert_file: /var/run/secrets/ans-openshell/platform/cert.pem
+agents:
+  - agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
+    ans_name: ans://v1.0.0.payments.example.com
+    sandbox_names: [payments]            # container.name in the OCSF record
+    sandbox_uids: []                     # container.uid, the durable association
