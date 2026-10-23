@@ -92,15 +92,17 @@ func (s *agentStats) rate() float64 {
 
 // aggregator attributes events to agents and tracks the input window.
 type aggregator struct {
-	agents      AgentMap
-	window      *Window
-	earliest    time.Time
-	latest      time.Time
-	stats       map[string]*agentStats
-	unmapped    int
-	noContainer int
-	outOfWindow int
-	attributed  int
+	activity        *activityAggregator
+	skipLegacyStats bool
+	agents          AgentMap
+	window          *Window
+	earliest        time.Time
+	latest          time.Time
+	stats           map[string]*agentStats
+	unmapped        int
+	noContainer     int
+	outOfWindow     int
+	attributed      int
 }
 
 func newAggregator(agents AgentMap, window *Window) *aggregator {
@@ -108,6 +110,9 @@ func newAggregator(agents AgentMap, window *Window) *aggregator {
 }
 
 func (a *aggregator) add(ev Event) {
+	if a.activity != nil {
+		a.activity.add(ev)
+	}
 	ts, hasTime := ev.Timestamp()
 	if a.window != nil {
 		if !hasTime || !a.window.Contains(ts) {
@@ -131,7 +136,11 @@ func (a *aggregator) add(ev Event) {
 		st = newAgentStats(mapping)
 		a.stats[mapping.AgentID] = st
 	}
-	st.add(ev)
+	if a.skipLegacyStats {
+		st.events++
+	} else {
+		st.add(ev)
+	}
 }
 
 func (a *aggregator) extend(ts time.Time) {

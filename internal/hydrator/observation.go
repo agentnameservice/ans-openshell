@@ -17,6 +17,8 @@ const (
 // SignalConfig names the signals observations are posted under and selects
 // which to emit. Empty identifiers take the defaults.
 type SignalConfig struct {
+	ActivityID              string
+	EmitActivity            bool
 	PolicyViolationRateID   string
 	ProtocolAdherenceID     string
 	EmitPolicyViolationRate bool
@@ -34,6 +36,9 @@ func DefaultSignalConfig() SignalConfig {
 }
 
 func (c SignalConfig) withDefaults() SignalConfig {
+	if c.ActivityID == "" {
+		c.ActivityID = DefaultActivitySignal
+	}
 	if c.PolicyViolationRateID == "" {
 		c.PolicyViolationRateID = DefaultPolicyViolationRateSignal
 	}

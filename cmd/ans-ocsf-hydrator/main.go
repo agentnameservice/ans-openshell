@@ -40,7 +40,13 @@ type fileConfig struct {
 	Signals struct {
 		PolicyViolationRate *string `yaml:"policy_violation_rate"`
 		ProtocolAdherence   *string `yaml:"protocol_adherence"`
+		Activity            *string `yaml:"activity"`
 	} `yaml:"signals"`
+	Activity struct {
+		MinDecisions    int `yaml:"min_decisions"`
+		MaxUIDsPerAgent int `yaml:"max_uids_per_agent"`
+		MaxUIDs         int `yaml:"max_uids"`
+	} `yaml:"activity"`
 	Signing struct {
 		KeyFile  string `yaml:"key_file"`
 		CertFile string `yaml:"cert_file"`
@@ -50,6 +56,7 @@ type fileConfig struct {
 
 type flags struct {
 	configPath, input, windowStart, windowEnd string
+	evidenceOutput                            string
 	windowLast                                time.Duration
 	dryRun, allowUnmapped                     bool
 }
@@ -61,6 +68,7 @@ type flags struct {
 var (
 	errNoEvents          = errors.New("input had lines but no OCSF events; check that ocsf_json_enabled is set and that the collector writes bare lines (set --allow-unmapped to accept this)")
 	errNothingAttributed = errors.New("events were parsed but none of them mapped to a configured agent (set --allow-unmapped to accept this)")
+	errNoSignals         = errors.New("signals: every signal is disabled; nothing would be posted (select --evidence-output for local evidence only)")
 )
 
 func main() {
@@ -75,6 +83,7 @@ func run() error {
 	flag.StringVar(&f.configPath, "config", "", "path to the YAML configuration (required)")
 	flag.StringVar(&f.input, "input", "-", "OCSF JSONL file, or - for stdin")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the import request instead of posting it")
+	flag.StringVar(&f.evidenceOutput, "evidence-output", "", "write corrected structured evidence as JSONL to a new file, or - for stdout (stdout cannot be combined with --dry-run)")
 	flag.BoolVar(&f.allowUnmapped, "allow-unmapped", false, "exit 0 when the input yields no OCSF events or none of them map to an agent")
 	flag.StringVar(&f.windowStart, "window-start", "", "RFC 3339 start of the observation window (default: first event)")
 	flag.StringVar(&f.windowEnd, "window-end", "", "RFC 3339 end of the observation window (default: last event)")
@@ -98,23 +107,38 @@ func run() error {
 	if err := config.Load(f.configPath, &cfg); err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return hydrate(ctx, cfg, f, logger)
+}
+
+func hydrate(ctx context.Context, cfg fileConfig, f flags, logger *slog.Logger) error {
 	opts, err := buildOptions(cfg, f)
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	sink, err := buildSink(ctx, cfg, f.dryRun, logger)
-	if err != nil {
-		return err
+	var sink hydrator.Sink = hydrator.NewWriterSink(io.Discard)
+	if opts.Signals.EmitPolicyViolationRate || opts.Signals.EmitProtocolAdherence || opts.Signals.EmitActivity {
+		sink, err = buildSink(ctx, cfg, f.dryRun, logger)
+		if err != nil {
+			return err
+		}
 	}
 	in, closeInput, err := openInput(f.input)
 	if err != nil {
 		return err
 	}
 	defer closeInput()
+	evidence, closeEvidence, err := openEvidence(f.evidenceOutput, f.dryRun)
+	if err != nil {
+		return err
+	}
+	opts.Evidence = evidence
 
 	report, err := hydrator.Run(ctx, in, sink, opts, logger)
+	if closeErr := closeEvidence(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close evidence output: %w", closeErr))
+	}
 	logReport(ctx, logger, cfg.Agents, report, err)
 	if err != nil {
 		return err
@@ -154,10 +178,16 @@ func buildOptions(cfg fileConfig, f flags) (hydrator.Options, error) {
 		return hydrator.Options{}, errors.New("provenance.aim_id is required")
 	}
 	signals, err := signalConfig(cfg)
-	if err != nil {
+	if err != nil && (!errors.Is(err, errNoSignals) || f.evidenceOutput == "") {
 		return hydrator.Options{}, err
 	}
-	opts := hydrator.Options{Agents: agents, Signals: signals, AIMID: cfg.Provenance.AIMID, EvidenceURL: cfg.Provenance.EvidenceURL}
+	activity := hydrator.ActivityConfig{
+		MinDecisions: cfg.Activity.MinDecisions, MaxUIDsPerAgent: cfg.Activity.MaxUIDsPerAgent, MaxUIDs: cfg.Activity.MaxUIDs,
+	}
+	if err := activity.Validate(); err != nil {
+		return hydrator.Options{}, err
+	}
+	opts := hydrator.Options{Agents: agents, Signals: signals, Activity: activity, AIMID: cfg.Provenance.AIMID, EvidenceURL: cfg.Provenance.EvidenceURL}
 	if opts.Signer, err = batchSigner(cfg); err != nil {
 		return hydrator.Options{}, err
 	}
@@ -202,8 +232,12 @@ func signalConfig(cfg fileConfig) (hydrator.SignalConfig, error) {
 		signals.ProtocolAdherenceID = *cfg.Signals.ProtocolAdherence
 		signals.EmitProtocolAdherence = *cfg.Signals.ProtocolAdherence != ""
 	}
-	if !signals.EmitPolicyViolationRate && !signals.EmitProtocolAdherence {
-		return hydrator.SignalConfig{}, errors.New("signals: every signal is disabled; nothing would be posted")
+	if cfg.Signals.Activity != nil {
+		signals.ActivityID = *cfg.Signals.Activity
+		signals.EmitActivity = *cfg.Signals.Activity != ""
+	}
+	if !signals.EmitPolicyViolationRate && !signals.EmitProtocolAdherence && !signals.EmitActivity {
+		return signals, errNoSignals
 	}
 	return signals, nil
 }
@@ -285,6 +319,26 @@ func openInput(path string) (io.Reader, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
+// openEvidence refuses existing files so evidence cannot truncate the input or
+// configuration, including aliases through symlinks or hard links.
+func openEvidence(path string, dryRun bool) (io.Writer, func() error, error) {
+	noop := func() error { return nil }
+	if path == "" {
+		return nil, noop, nil
+	}
+	if path == "-" {
+		if dryRun {
+			return nil, nil, errors.New("--evidence-output - cannot be combined with --dry-run: both write to stdout")
+		}
+		return os.Stdout, noop, nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--evidence-output: create new file: %w", err)
+	}
+	return f, f.Close, nil
+}
+
 func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.AgentMapping, r hydrator.Report, runErr error) {
 	if runErr != nil {
 		logger.ErrorContext(ctx, "hydration failed", "err", runErr)
@@ -304,5 +358,21 @@ func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.A
 		if !seen[m.AgentID] {
 			logger.WarnContext(ctx, "configured agent received no events", "agent_id", m.AgentID, "ans_name", m.AnsName)
 		}
+	}
+	logActivity(ctx, logger, r.Activity)
+}
+
+func logActivity(ctx context.Context, logger *slog.Logger, evidence []hydrator.ActivityEvidence) {
+	for _, item := range evidence {
+		var score any
+		if item.Score != nil {
+			score = *item.Score
+		}
+		level := slog.LevelWarn
+		if item.Unavailable == "" || item.Unavailable == "no_eligible_decisions" || item.Unavailable == "insufficient_sample" {
+			level = slog.LevelInfo
+		}
+		logger.Log(ctx, level, "activity summary", "agent_id", item.AgentID,
+			"score", score, "sample_size", item.SampleSize, "unavailable_reason", item.Unavailable)
 	}
 }

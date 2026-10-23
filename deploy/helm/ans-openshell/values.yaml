@@ -77,7 +77,8 @@ interceptor:
 # it may run on (or pin it with nodeSelector), mount it with extraVolumes and extraVolumeMounts and
 # point input at it. The hydrator signs and posts what it reads, so only the collector may write
 # that volume. The gateway's ocsf_log JSONL carries gateway-origin events only, not sandbox
-# traffic. Each run aggregates the trailing window, so keep window aligned with schedule.
+# traffic. The window may be longer than the schedule (for example, 24h every 15m);
+# retain enough source logs for the selected window.
 hydrator:
   enabled: false
   image:
@@ -86,6 +87,7 @@ hydrator:
   schedule: "*/15 * * * *"
   window: 15m          # --window-last; empty aggregates the whole input every run
   input: /var/log/openshell/supervisor-ocsf.jsonl
+  evidenceOutput: ""   # optional corrected JSONL evidence; use "-" for stdout, or a new file on a writable volume
   nodeSelector: {}
   adminKeySecret: ""   # secret with key ANS_TRUST_INDEX_ADMIN_KEY; empty posts without Authorization
   extraVolumes: []
@@ -95,6 +97,14 @@ hydrator:
       base_url: https://trust-index.example.com
     provenance:
       aim_id: ans://v1.0.0.platform.example.com
+    signals:
+      policy_violation_rate: openshell.policyViolationRate
+      protocol_adherence: openshell.protocolAdherence
+      activity: ""     # opt in with openshell.behavior.activity after registering it; disable both legacy outputs above
+    activity:
+      min_decisions: 1
+      max_uids_per_agent: 100000
+      max_uids: 1000000
     agents:
       - agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
         ans_name: ans://v1.0.0.payments.example.com

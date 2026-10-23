@@ -45,6 +45,10 @@ spec:
                 - --window-last
                 - {{ . | quote }}
 {{- end }}
+{{- with .Values.hydrator.evidenceOutput }}
+                - --evidence-output
+                - {{ . | quote }}
+{{- end }}
 {{- if .Values.hydrator.adminKeySecret }}
               envFrom:
                 - secretRef: {name: {{ .Values.hydrator.adminKeySecret }}}

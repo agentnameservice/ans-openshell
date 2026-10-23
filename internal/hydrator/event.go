@@ -53,6 +53,10 @@ type Event struct {
 	DstEndpoint   *Endpoint     `json:"dst_endpoint"`
 	Actor         *Actor        `json:"actor"`
 	FirewallRule  *FirewallRule `json:"firewall_rule"`
+	// Raw metadata preserves legacy decoding even when the optional fields
+	// have a shape the corrected evidence path does not understand.
+	Unmapped    json.RawMessage `json:"unmapped"`
+	FindingInfo json.RawMessage `json:"finding_info"`
 }
 
 // Metadata is the OCSF metadata object.
@@ -147,6 +151,10 @@ type Reader struct {
 	br    *bufio.Reader
 	line  []byte
 	stats ParseStats
+	// invalidOCSF is deliberately separate from the legacy public counters.
+	// The corrected evidence path cannot safely attribute a discarded audit line.
+	invalidOCSF   int
+	oversizedOCSF int
 }
 
 // NewReader returns a Reader over r.
@@ -171,6 +179,9 @@ func (r *Reader) Read() (Event, error) {
 		}
 		ev, ok := decodeLine(line)
 		if !ok {
+			if looksLikeAudit(line) {
+				r.invalidOCSF++
+			}
 			r.stats.Skipped++
 			continue
 		}
@@ -196,6 +207,9 @@ func (r *Reader) readLine() ([]byte, bool, error) {
 		}
 		if !oversized {
 			if len(r.line)+len(chunk) > MaxLineBytes {
+				if looksLikeAudit(r.line) || looksLikeAudit(chunk) {
+					r.oversizedOCSF++
+				}
 				oversized = true
 				r.line = r.line[:0]
 			} else {
@@ -210,6 +224,10 @@ func (r *Reader) readLine() ([]byte, bool, error) {
 		}
 		return r.line, oversized, nil
 	}
+}
+
+func looksLikeAudit(line []byte) bool {
+	return bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) || bytes.Contains(line, []byte("OCSF-JSON"))
 }
 
 // decodeLine extracts the JSON payload from a JSONL or stderr line and

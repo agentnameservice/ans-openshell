@@ -16,6 +16,11 @@ import (
 
 // Options configures Run.
 type Options struct {
+	// Activity configures the optional corrected evidence and score path.
+	Activity ActivityConfig
+	// Evidence receives one local ActivityEvidence JSON object per agent. It
+	// is independent of score emission, including finding-only windows.
+	Evidence io.Writer
 	// Agents attributes sandboxes to agents.
 	Agents AgentMap
 	// Signals selects the signals to emit and names them.
@@ -47,7 +52,9 @@ type AgentSummary struct {
 
 // Report describes one Run.
 type Report struct {
-	Parse ParseStats
+	// Activity is populated only when corrected evidence or scores were requested.
+	Activity []ActivityEvidence
+	Parse    ParseStats
 	// Attributed counts events that resolved to a configured agent and fell
 	// inside the window, whatever their class.
 	Attributed int
@@ -74,12 +81,19 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
+	if err := opts.Activity.Validate(); err != nil {
+		return Report{}, err
+	}
 	clock := opts.Clock
 	if clock == nil {
 		clock = time.Now
 	}
 	reader := NewReader(in)
 	agg := newAggregator(opts.Agents, opts.Window)
+	if opts.Signals.EmitActivity || opts.Evidence != nil {
+		agg.activity = newActivityAggregator(opts.Agents, opts.Window, opts.Activity)
+		agg.skipLegacyStats = !opts.Signals.EmitPolicyViolationRate && !opts.Signals.EmitProtocolAdherence
+	}
 	err := consume(ctx, reader, agg)
 	report := Report{
 		Parse:       reader.Stats(),
@@ -91,6 +105,17 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	}
 	if err != nil {
 		return report, err
+	}
+	if agg.activity != nil {
+		report.Activity = agg.activity.evidence(report.Window, reader.invalidOCSF+reader.oversizedOCSF)
+		if opts.Evidence != nil {
+			encoder := json.NewEncoder(opts.Evidence)
+			for _, evidence := range report.Activity {
+				if err := encoder.Encode(evidence); err != nil {
+					return report, fmt.Errorf("hydrator: write activity evidence: %w", err)
+				}
+			}
+		}
 	}
 	logger.DebugContext(ctx, "input parsed",
 		"lines", report.Parse.Lines, "events", report.Parse.Events,
@@ -148,6 +173,10 @@ func buildObservations(agg *aggregator, window Window, opts Options, report *Rep
 		window:     window,
 	}
 	ids := slices.Sorted(maps.Keys(agg.stats))
+	activity := make(map[string]ActivityEvidence, len(report.Activity))
+	for _, evidence := range report.Activity {
+		activity[evidence.AgentID] = evidence
+	}
 	observations := make([]Observation, 0, len(ids))
 	report.Agents = make([]AgentSummary, 0, len(ids))
 	for _, id := range ids {
@@ -156,12 +185,29 @@ func buildObservations(agg *aggregator, window Window, opts Options, report *Rep
 		if err != nil {
 			return nil, err
 		}
+		if evidence, ok := activity[id]; ok && builder.signals.EmitActivity && evidence.Score != nil {
+			value := struct {
+				Score       int    `json:"score"`
+				Explanation string `json:"explanation"`
+			}{Score: *evidence.Score, Explanation: activityExplanation(evidence)}
+			row, err := builder.observation(id, builder.signals.ActivityID, value)
+			if err != nil {
+				return nil, err
+			}
+			obs = append(obs, row)
+		}
 		observations = append(observations, obs...)
+		denied := st.denied
+		if agg.skipLegacyStats {
+			for _, counts := range activity[id].Measurements.groups() {
+				denied += counts.Denied
+			}
+		}
 		report.Agents = append(report.Agents, AgentSummary{
 			AgentID:      id,
 			AnsName:      st.mapping.AnsName,
 			Events:       st.events,
-			Denied:       st.denied,
+			Denied:       denied,
 			Observations: len(obs),
 		})
 	}
