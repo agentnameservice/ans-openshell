@@ -317,6 +317,7 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 	}
 
 	// Run transform chain
+	var signURL string
 	for _, t := range s.rewriters {
 		tr := t.Apply(ctx, capTarget, requirement, signBody)
 		switch tr.Kind {
@@ -325,6 +326,8 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 		case capability.Allow:
 			signBody = tr.Body
 			out.setBody(tr.Body)
+			// G1: capture SignURL from transforms (last writer wins).
+			signURL = tr.SignURL
 		case capability.Passthrough:
 			// Continue to next transform
 		}
@@ -335,8 +338,12 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 		return out.deny(&denial{ReasonRequestRewriteUnsupported, "credential placeholders in a signed body or path require signing after credential rewriting"})
 	}
 
-	// Sign the (potentially rewritten) body
-	if d := s.attach(ctx, id, method, target, signBody, out); d != nil {
+	// Sign the (potentially rewritten) body with signURL (if set) or target (G1: external URL binding).
+	htu := target
+	if signURL != "" {
+		htu = signURL
+	}
+	if d := s.attach(ctx, id, method, htu, signBody, out); d != nil {
 		return out.deny(d)
 	}
 	return out.allow()

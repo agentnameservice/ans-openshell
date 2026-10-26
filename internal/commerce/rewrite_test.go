@@ -34,15 +34,22 @@ qxLJH8nppWLHVdJvxMlvmJNLcQh3PRe6mXF1wnTvzWFhZj0c+0/qrjPd
 
 // fakeAuthorityWithError is a fake AuthorityClient that can return errors.
 type fakeAuthorityWithError struct {
-	mandate *Mandate
-	err     error
+	mandate  *Mandate
+	rawBytes json.RawMessage
+	err      error
 }
 
-func (f *fakeAuthorityWithError) RequestMandate(_ context.Context, _ MandateInput) (*Mandate, error) {
+func (f *fakeAuthorityWithError) RequestMandate(_ context.Context, _ MandateInput) (*Mandate, json.RawMessage, error) {
 	if f.err != nil {
-		return nil, f.err
+		return nil, nil, f.err
 	}
-	return f.mandate, nil
+	// If rawBytes not set, generate from mandate
+	raw := f.rawBytes
+	if raw == nil && f.mandate != nil {
+		rawData, _ := json.Marshal(f.mandate)
+		raw = json.RawMessage(rawData)
+	}
+	return f.mandate, raw, nil
 }
 
 // fakeNonce is a fake Nonce for testing.
@@ -422,4 +429,203 @@ func TestRewrite_DenyOnMandateError(t *testing.T) {
 	if len(outcome.Body) != 0 {
 		t.Errorf("expected no body for Deny, got %d bytes", len(outcome.Body))
 	}
+}
+
+func TestRewrite_PreservesFloatFormatVerbatim(t *testing.T) {
+	// THE KEY TEST: mandate with max_amount:1000.0 must appear in rewritten body with .0 preserved
+	key := loadRewriteTestKey(t)
+
+	// Raw bytes from "authority" with max_amount:1000.0 (WITH the .0)
+	rawMandateWithDot := json.RawMessage(`{"mandate_id":"mandate-001","quote_id":"demo-quote-001","subject_ans":"ans://traveler.example.com","audience_ans":"ans://seller.skybound-travel.com","scope":"commerce.payment:write","max_amount":1000.0,"currency":"USD","not_before":"2026-01-01T00:00:00Z","not_after":"2026-12-31T23:59:59Z","jkt":"` + key.JKT() + `","authority_ans":"ans://authority.example.com","signature":"fake-signature"}`)
+
+	// Typed mandate (for validation)
+	mandate := &Mandate{
+		MandateID:    "mandate-001",
+		QuoteID:      "demo-quote-001",
+		SubjectANS:   "ans://traveler.example.com",
+		AudienceANS:  "ans://seller.skybound-travel.com",
+		Scope:        "commerce.payment:write",
+		MaxAmount:    1000.0,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://authority.example.com",
+		Signature:    "fake-signature",
+	}
+
+	fakeAuth := &fakeAuthorityWithError{
+		mandate:  mandate,
+		rawBytes: rawMandateWithDot,
+	}
+
+	clock := fakeClock{now: 1735689600}
+	nonce := &fakeNonce{jti: "test-jti-123"}
+
+	deps := Deps{
+		Key:       key,
+		Cache:     NewMandateCache(),
+		Authority: fakeAuth,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+
+	cfg := Config{
+		SellerMCPURL: "https://seller.skybound-travel.com/mcp/",
+		SellerANS:    "ans://seller.skybound-travel.com",
+		ScopePrefix:  "commerce.",
+		SubjectANS:   "ans://traveler.example.com",
+		MaxBodyBytes: 10000,
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
+
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
+
+	if outcome.Kind != Allow {
+		t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+	}
+
+	// The CRITICAL assertion: the rewritten body must contain "max_amount":1000.0 (WITH .0)
+	bodyStr := string(outcome.Body)
+	if !strings.Contains(bodyStr, `"max_amount":1000.0`) {
+		t.Errorf("rewritten body MUST preserve max_amount:1000.0 (with .0), got: %s", bodyStr)
+	}
+
+	// Prove the fix matters: re-marshaling the typed mandate would LOSE the .0
+	remarshaled, err := json.Marshal(mandate)
+	if err != nil {
+		t.Fatalf("failed to re-marshal mandate: %v", err)
+	}
+	if strings.Contains(string(remarshaled), `"max_amount":1000.0`) {
+		t.Errorf("re-marshaled struct should NOT preserve .0 (this proves the fix was needed), got: %s", string(remarshaled))
+	}
+}
+
+func TestRewrite_PreservesNonIntegerFloats(t *testing.T) {
+	// Test that non-integer floats like 1234.56 round-trip verbatim
+	key := loadRewriteTestKey(t)
+
+	rawMandateWithDecimal := json.RawMessage(`{"mandate_id":"mandate-002","quote_id":"demo-quote-002","subject_ans":"ans://traveler.example.com","audience_ans":"ans://seller.skybound-travel.com","scope":"commerce.payment:write","max_amount":1234.56,"currency":"USD","not_before":"2026-01-01T00:00:00Z","not_after":"2026-12-31T23:59:59Z","jkt":"` + key.JKT() + `","authority_ans":"ans://authority.example.com","signature":"fake-signature"}`)
+
+	mandate := &Mandate{
+		MandateID:    "mandate-002",
+		QuoteID:      "demo-quote-002",
+		SubjectANS:   "ans://traveler.example.com",
+		AudienceANS:  "ans://seller.skybound-travel.com",
+		Scope:        "commerce.payment:write",
+		MaxAmount:    1234.56,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://authority.example.com",
+		Signature:    "fake-signature",
+	}
+
+	fakeAuth := &fakeAuthorityWithError{
+		mandate:  mandate,
+		rawBytes: rawMandateWithDecimal,
+	}
+
+	clock := fakeClock{now: 1735689600}
+	nonce := &fakeNonce{jti: "test-jti-123"}
+
+	deps := Deps{
+		Key:       key,
+		Cache:     NewMandateCache(),
+		Authority: fakeAuth,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+
+	cfg := Config{
+		SellerMCPURL: "https://seller.skybound-travel.com/mcp/",
+		SellerANS:    "ans://seller.skybound-travel.com",
+		ScopePrefix:  "commerce.",
+		SubjectANS:   "ans://traveler.example.com",
+		MaxBodyBytes: 10000,
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-002","amount":100,"currency":"USD"}}}`)
+
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
+
+	if outcome.Kind != Allow {
+		t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+	}
+
+	// Verify 1234.56 is preserved verbatim
+	bodyStr := string(outcome.Body)
+	if !strings.Contains(bodyStr, `"max_amount":1234.56`) {
+		t.Errorf("rewritten body must preserve max_amount:1234.56 verbatim, got: %s", bodyStr)
+	}
+}
+
+func TestRewrite_SignURLSetOnAllow(t *testing.T) {
+	// Create a test commerce key
+	key := loadRewriteTestKey(t)
+
+	// Create a fake mandate
+	mandate := &Mandate{
+		MandateID:    "mandate-001",
+		QuoteID:      "demo-quote-001",
+		SubjectANS:   "ans://traveler.example.com",
+		AudienceANS:  "ans://seller.skybound-travel.com",
+		Scope:        "commerce.payment:write",
+		MaxAmount:    1000.0,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://authority.example.com",
+		Signature:    "fake-signature",
+	}
+
+	fakeAuth := &fakeAuthorityWithError{mandate: mandate}
+	clock := fakeClock{now: 1735689600}
+	nonce := &fakeNonce{jti: "test-jti-123"}
+
+	deps := Deps{
+		Key:       key,
+		Cache:     NewMandateCache(),
+		Authority: fakeAuth,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+
+	cfg := Config{
+		SellerMCPURL: "https://seller.skybound-travel.com/mcp/",
+		SellerANS:    "ans://seller.skybound-travel.com",
+		ScopePrefix:  "commerce.",
+		SubjectANS:   "ans://traveler.example.com",
+		MaxBodyBytes: 10000,
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
+
+	t.Run("SignURL matches SellerMCPURL", func(t *testing.T) {
+		outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
+
+		if outcome.Kind != Allow {
+			t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+		}
+
+		if outcome.SignURL != cfg.SellerMCPURL {
+			t.Errorf("expected SignURL = %q, got %q", cfg.SellerMCPURL, outcome.SignURL)
+		}
+	})
+
+	t.Run("SignURL matches htuOverride when set", func(t *testing.T) {
+		htuOverride := "https://discovered.seller.com/api/"
+		outcome := RewriteBookFlight(context.Background(), body, deps, cfg, htuOverride)
+
+		if outcome.Kind != Allow {
+			t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+		}
+
+		if outcome.SignURL != htuOverride {
+			t.Errorf("expected SignURL = %q, got %q", htuOverride, outcome.SignURL)
+		}
+	})
 }

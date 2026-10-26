@@ -28,7 +28,7 @@ const statusTokenBackoff = time.Minute
 // issues to its agents.
 type TL struct {
 	key      *ecdsa.PrivateKey
-	kid      [kidLen]byte
+	kid      [selfsign.KidLen]byte
 	rootKey  string
 	keyStore *scitt.KeyStore
 }

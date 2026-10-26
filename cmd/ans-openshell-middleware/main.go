@@ -324,7 +324,7 @@ func prefetchDemoMandate(cache *commerce.MandateCache, key *commercekey.Key, cfg
 		Amount:   cfg.DemoAmount,
 		Currency: cfg.DemoCurrency,
 	}
-	_, err := cache.GetOrFetch(
+	_, _, err := cache.GetOrFetch(
 		context.Background(), //nolint:contextcheck // Prefetch uses background context after server started
 		qk,
 		key.JKT(),

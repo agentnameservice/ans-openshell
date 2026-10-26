@@ -76,8 +76,12 @@ func Load(path string) (*Key, error) {
 func (k *Key) PublicJWK() JwkPublic {
 	// Get uncompressed public key bytes (0x04 || X || Y)
 	// For P-256: 1 byte prefix + 32 bytes X + 32 bytes Y = 65 bytes total
-	pubBytes := elliptic.Marshal(k.key.Curve, k.key.PublicKey.X, k.key.PublicKey.Y) //nolint:staticcheck // Using X/Y for JWK encoding
-	const p256UncompressedLen = 65                                                  // 1 prefix + 32 X + 32 Y
+	ecdhPub, err := k.key.PublicKey.ECDH()
+	if err != nil {
+		panic(fmt.Sprintf("ECDH conversion: %v", err))
+	}
+	pubBytes := ecdhPub.Bytes()
+	const p256UncompressedLen = 65 // 1 prefix + 32 X + 32 Y
 	if len(pubBytes) != p256UncompressedLen {
 		panic("unexpected public key length")
 	}

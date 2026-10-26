@@ -75,7 +75,7 @@ type jsonRPCError struct {
 
 // RequestMandate requests a mandate from the authority service via JSON-RPC.
 // It implements the AuthorityClient interface.
-func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*Mandate, error) {
+func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*Mandate, json.RawMessage, error) {
 	// Build JSON-RPC request envelope
 	envelope := jsonRPCRequest{
 		Jsonrpc: "2.0",
@@ -90,27 +90,27 @@ func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*M
 	// Marshal request to JSON
 	requestBody, err := json.Marshal(envelope)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL, bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	// Send request
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	// Check for non-2xx status
@@ -120,7 +120,7 @@ func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*M
 		if len(truncated) > maxErrBodyLen {
 			truncated = truncated[:maxErrBodyLen]
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncated)
+		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncated)
 	}
 
 	// Parse mandate from response
@@ -128,35 +128,38 @@ func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*M
 }
 
 // parseMandateResponse parses a mandate from a JSON-RPC response body.
-// Returns an error if the response contains an error object, has no content,
-// or cannot be parsed.
-func parseMandateResponse(body []byte) (*Mandate, error) {
+// Returns the parsed mandate, the raw JSON bytes from the authority, and an error.
+// The raw bytes preserve the exact formatting (e.g., "max_amount":1000.0) from the authority.
+func parseMandateResponse(body []byte) (*Mandate, json.RawMessage, error) {
 	var response jsonRPCResponse
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("JSON parse failed: %w", err)
+		return nil, nil, fmt.Errorf("JSON parse failed: %w", err)
 	}
 
 	// Check for error object
 	if response.Error != nil {
-		return nil, fmt.Errorf("authority error: %s", response.Error.Message)
+		return nil, nil, fmt.Errorf("authority error: %s", response.Error.Message)
 	}
 
 	// Check for result
 	if response.Result == nil {
-		return nil, errors.New("no result in response")
+		return nil, nil, errors.New("no result in response")
 	}
 
 	// Check for content
 	if len(response.Result.Content) == 0 {
-		return nil, errors.New("no content in authority response")
+		return nil, nil, errors.New("no content in authority response")
 	}
 
-	// Parse mandate from first content item text
+	// Get the raw mandate text from first content item
 	mandateText := response.Result.Content[0].Text
+
+	// Parse mandate from text for validation
 	var mandate Mandate
 	if err := json.Unmarshal([]byte(mandateText), &mandate); err != nil {
-		return nil, fmt.Errorf("failed to parse mandate from content: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse mandate from content: %w", err)
 	}
 
-	return &mandate, nil
+	// Return both the parsed mandate and the raw bytes
+	return &mandate, json.RawMessage(mandateText), nil
 }

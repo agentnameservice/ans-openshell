@@ -46,9 +46,10 @@ type Deps struct {
 
 // Outcome represents the result of a rewrite operation.
 type Outcome struct {
-	Kind   OutcomeKind
-	Body   []byte // Set only for Allow
-	Reason string // Set only for Deny
+	Kind    OutcomeKind
+	Body    []byte // Set only for Allow
+	Reason  string // Set only for Deny
+	SignURL string // Set only for Allow: externally-visible URL for identity proof htu binding
 }
 
 // RewriteBookFlight orchestrates mandate fetching and DPoP injection for book_flight requests.
@@ -130,7 +131,8 @@ func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config, htu
 	}
 
 	// Fetch mandate (with caching and validation)
-	mandate, err := d.Cache.GetOrFetch(
+	// Returns typed mandate (already validated by GetOrFetch) and raw bytes (for forwarding)
+	_, rawMandateBytes, err := d.Cache.GetOrFetch(
 		ctx,
 		qk,
 		d.Key.JKT(),
@@ -166,7 +168,8 @@ func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config, htu
 	}
 
 	// Splice mandate and dpop_proof into arguments (overwrite if present)
-	args["mandate"] = mandate
+	// CRITICAL: Use json.RawMessage so Marshal emits the authority's bytes VERBATIM
+	args["mandate"] = rawMandateBytes
 	args["dpop_proof"] = proof
 
 	// Re-marshal the request
@@ -180,5 +183,5 @@ func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config, htu
 		return Outcome{Kind: Deny, Reason: fmt.Sprintf("oversize: %d > %d", len(rewritten), cfg.MaxBodyBytes)}
 	}
 
-	return Outcome{Kind: Allow, Body: rewritten}
+	return Outcome{Kind: Allow, Body: rewritten, SignURL: htu}
 }

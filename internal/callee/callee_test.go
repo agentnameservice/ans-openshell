@@ -957,3 +957,79 @@ func TestBodyGuard_ReadError(t *testing.T) {
 		t.Errorf("response body = %q, want 'failed to read body'", body)
 	}
 }
+
+func TestForward_AcceptsIdentityProofWithVerbatimSellerURLHtu(t *testing.T) {
+	t.Parallel()
+	tl := testfixtures.MustNewTL()
+	id := testfixtures.MustNewIdentity("agent-123", "ans://v1.0.0.agent.example")
+
+	// Seller with a specific path (e.g., "/mcp/")
+	var receivedPath string
+	seller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer seller.Close()
+
+	// Configure SellerURL as the base (no trailing slash).
+	// G1: The ingress computes expected htu = SellerURL + r.URL.Path (no query).
+	// This fixes the old "+ RequestURI()" which caused double-slash issues.
+	sellerBase := seller.URL + "/mcp"
+
+	h, err := New(context.Background(), Config{
+		RootKeys:     []string{tl.RootKeyC2SP()},
+		TrustedHosts: []string{"ingress.example"}, // Placeholder
+		SellerURL:    sellerBase,
+	}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer h.Close()
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	signer, err := pop.NewSigner(id.Key, id.CertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, token := testfixtures.StaticArtifacts(tl, id)
+
+	// G1: Sign for sellerBase + "/" (the external URL the egress signs).
+	// The ingress receives the request at "/" and computes expected htu = sellerBase + "/".
+	originalBody := `{"task":"commerce-book-flight"}`
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, sellerBase+"/",
+		strings.NewReader(originalBody))
+	req.Header.Set("Content-Type", "application/json")
+	if attachErr := pop.AttachIdentity(req, signer, http.Header{
+		scitt.HeaderReceipt:     {receipt},
+		scitt.HeaderStatusToken: {token},
+	}); attachErr != nil {
+		t.Fatal(attachErr)
+	}
+
+	// Now redirect the request to the ingress at path "/".
+	// The identity proof's htu is sellerBase + "/" = the external URL.
+	req.URL.Host = srv.Listener.Addr().String()
+	req.URL.Scheme = "http"
+	req.URL.Path = "/"
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// The ingress should ACCEPT the identity proof (htu = sellerBase + "/").
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (G1: identity proof htu should match SellerURL + path), body: %s",
+			resp.StatusCode, respBody)
+	}
+
+	// Assert the seller received the request at "/mcp/" (the ingress forwarded to sellerBase + path).
+	if receivedPath != "/mcp/" {
+		t.Errorf("seller received path %q, want /mcp/", receivedPath)
+	}
+}

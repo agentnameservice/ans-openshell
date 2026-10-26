@@ -40,7 +40,8 @@ const (
 	claimIdentityCerts = 6
 )
 
-const kidLen = 4
+// KidLen is the length of the key identifier in bytes.
+const KidLen = 4
 
 // StatusToken mints a COSE_Sign1 status token vouching identityFP as the
 // x509-ov-client identity certificate of agentID, registered under ansName,
@@ -103,16 +104,22 @@ func mustCBOR(v any) []byte {
 	return b
 }
 
+// KidFromSPKI computes the key identifier from DER-encoded SubjectPublicKeyInfo bytes.
+// Returns the first KidLen bytes of SHA-256(spkiDER).
+func KidFromSPKI(spkiDER []byte) [KidLen]byte {
+	h := sha256.Sum256(spkiDER)
+	var kid [KidLen]byte
+	copy(kid[:], h[:KidLen])
+	return kid
+}
+
 // kidFor computes the 4-byte key ID from an ECDSA public key.
-func kidFor(key *ecdsa.PrivateKey) [kidLen]byte {
+func kidFor(key *ecdsa.PrivateKey) [KidLen]byte {
 	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
 	if err != nil {
 		panic(err)
 	}
-	h := sha256.Sum256(spki)
-	var kid [kidLen]byte
-	copy(kid[:], h[:kidLen])
-	return kid
+	return KidFromSPKI(spki)
 }
 
 // leafEnvelope is the transparency-log leaf a receipt signs: the event wrapped

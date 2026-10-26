@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -783,10 +784,11 @@ func TestEvaluate_CredentialMarkerInRewrittenBodyDenied(t *testing.T) {
 
 // stubTransform is a test stub implementing capability.Transform.
 type stubTransform struct {
-	kind   capability.OutcomeKind
-	body   []byte
-	reason string
-	called *bool
+	kind    capability.OutcomeKind
+	body    []byte
+	reason  string
+	signURL string
+	called  *bool
 }
 
 func (s *stubTransform) Provides() []capability.Capability {
@@ -798,9 +800,10 @@ func (s *stubTransform) Apply(_ context.Context, _ capability.Target, _ capabili
 		*s.called = true
 	}
 	return capability.Outcome{
-		Kind:   s.kind,
-		Body:   s.body,
-		Reason: s.reason,
+		Kind:    s.kind,
+		Body:    s.body,
+		Reason:  s.reason,
+		SignURL: s.signURL,
 	}
 }
 
@@ -1243,13 +1246,108 @@ func (f *fakeCommerceNonce) JTI() string {
 
 // fakeCommerceAuthority implements commerce.AuthorityClient for testing.
 type fakeCommerceAuthority struct {
-	mandate *commerce.Mandate
-	err     error
+	mandate  *commerce.Mandate
+	rawBytes json.RawMessage
+	err      error
 }
 
-func (f *fakeCommerceAuthority) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, error) {
+func (f *fakeCommerceAuthority) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, json.RawMessage, error) {
 	if f.err != nil {
-		return nil, f.err
+		return nil, nil, f.err
 	}
-	return f.mandate, nil
+	// If rawBytes not set, generate from mandate
+	raw := f.rawBytes
+	if raw == nil && f.mandate != nil {
+		rawData, _ := json.Marshal(f.mandate)
+		raw = json.RawMessage(rawData)
+	}
+	return f.mandate, raw, nil
+}
+
+func TestEvaluate_TransformSignURLBindsIdentityProof(t *testing.T) { //nolint:tparallel // subtests share signer state
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1"}}}`)
+	rewritten := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1","mandate":"M1","dpop_proof":"P1"}}}`)
+	externalURL := "https://seller.skybound-travel.com/mcp/"
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	t.Run("with SignURL set, identity proof htu binds SignURL", func(t *testing.T) {
+		signer.calls = nil // reset
+		transform := &stubTransform{kind: capability.Allow, body: rewritten, signURL: externalURL}
+
+		s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+		s.AddTransform(transform)
+
+		res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if res.GetDecision() != allow {
+			t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+		}
+
+		// Assert the identity proof was signed with externalURL, not the request target
+		if len(signer.calls) != 1 {
+			t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+		}
+		if signer.calls[0].url != externalURL {
+			t.Errorf("signed url = %q, want %q (SignURL)", signer.calls[0].url, externalURL)
+		}
+	})
+
+	t.Run("with empty SignURL, identity proof htu binds request target", func(t *testing.T) {
+		signer.calls = nil // reset
+		transform := &stubTransform{kind: capability.Allow, body: rewritten, signURL: ""}
+
+		s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+		s.AddTransform(transform)
+
+		res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if res.GetDecision() != allow {
+			t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+		}
+
+		// Assert the identity proof was signed with the request target (unchanged behavior)
+		if len(signer.calls) != 1 {
+			t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+		}
+		expectedTarget := "https://tools.example.com/v1/do"
+		if signer.calls[0].url != expectedTarget {
+			t.Errorf("signed url = %q, want %q (request target)", signer.calls[0].url, expectedTarget)
+		}
+	})
+
+	t.Run("no transform, identity proof htu binds request target", func(t *testing.T) {
+		signer.calls = nil // reset
+
+		s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+		// No transform added
+
+		res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if res.GetDecision() != allow {
+			t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+		}
+
+		// Assert the identity proof was signed with the request target (unchanged behavior)
+		if len(signer.calls) != 1 {
+			t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+		}
+		expectedTarget := "https://tools.example.com/v1/do"
+		if signer.calls[0].url != expectedTarget {
+			t.Errorf("signed url = %q, want %q (request target)", signer.calls[0].url, expectedTarget)
+		}
+	})
 }

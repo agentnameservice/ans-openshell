@@ -40,7 +40,7 @@ type QuoteKey struct {
 // Mirrors Rust mandate.rs:86-111.
 //
 // Examples:
-//   - "ans://v1.0.8.seller.skybound-travel.com" -> "seller.skybound-travel.com"
+//   - "ans://v1.0.8.seller.example.com"          -> "seller.example.com"
 //   - "ans://v2.1.authority.example.com"        -> "authority.example.com"
 //   - "ans://seller.example.com"                -> "seller.example.com"
 //   - "v1.0.8.seller.x.com"                     -> "seller.x.com"

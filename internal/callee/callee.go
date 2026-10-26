@@ -197,11 +197,13 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Handler, error)
 	}
 
 	if cfg.SellerURL != "" {
-		// Forward mode: pin htu to seller URL (G1). WithExternalURL requires
-		// appending r.URL.RequestURI() to bind the full request target.
+		// Forward mode: pin htu to seller URL + path (G1).
+		// The egress signs the identity proof with the external (seller) URL (commerce's htu).
+		// The ingress verifies against SellerURL (base) + the request path.
+		// This differs from the old "+ RequestURI()" which included query strings and caused double-slash issues.
 		opts = []pop.MiddlewareOption{
 			pop.WithExternalURL(func(r *http.Request) string {
-				return cfg.SellerURL + r.URL.RequestURI()
+				return cfg.SellerURL + r.URL.Path
 			}),
 			pop.WithMiddlewareLogger(logger),
 			pop.WithMiddlewareCallerOptions(callerOpts...),
@@ -305,8 +307,13 @@ func forwardToSeller(w http.ResponseWriter, r *http.Request, sellerURL string, c
 		return
 	}
 
+	// Build the upstream URL: sellerURL (base) + request path (G1).
+	// This matches the external URL used for htu verification.
+	// G704: sellerURL is operator configuration (validated at New); r.URL.Path is verified against the identity proof htu.
+	upstreamURL := sellerURL + r.URL.Path
+
 	// Build the upstream request with the same body and Content-Type.
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, sellerURL, bytes.NewReader(body))
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body)) //nolint:gosec // G704: upstreamURL is sellerURL (operator config) + verified path
 	if err != nil {
 		logger.ErrorContext(r.Context(), "build upstream request", "err", err)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
@@ -317,7 +324,7 @@ func forwardToSeller(w http.ResponseWriter, r *http.Request, sellerURL string, c
 	}
 
 	// Send to the seller.
-	upstreamResp, err := client.Do(upstreamReq)
+	upstreamResp, err := client.Do(upstreamReq) //nolint:gosec // G704: upstreamReq targets operator-configured sellerURL + verified path
 	if err != nil {
 		// Transport error (unreachable) → 502.
 		logger.ErrorContext(r.Context(), "forward to seller", "err", err)

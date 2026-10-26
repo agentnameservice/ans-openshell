@@ -2,6 +2,7 @@ package commerce
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -17,7 +18,7 @@ type Clock interface {
 
 // AuthorityClient requests mandates from an authority service.
 type AuthorityClient interface {
-	RequestMandate(ctx context.Context, in MandateInput) (*Mandate, error)
+	RequestMandate(ctx context.Context, in MandateInput) (*Mandate, json.RawMessage, error)
 }
 
 // MandateInput contains the parameters needed to request a mandate.
@@ -31,9 +32,10 @@ type MandateInput struct {
 	TravelerDPoPJWK commercekey.JwkPublic `json:"traveler_dpop_jwk"`
 }
 
-// cachedMandate holds a cached mandate with its expiry and quote key.
+// cachedMandate holds a cached mandate with its expiry, quote key, and raw JSON bytes.
 type cachedMandate struct {
 	mandate      *Mandate
+	rawBytes     json.RawMessage
 	notAfterUnix int64
 	quoteKey     QuoteKey
 }
@@ -49,9 +51,9 @@ func NewMandateCache() *MandateCache {
 	return &MandateCache{}
 }
 
-// GetOrFetch returns a cached mandate if it matches the quote key, JKT, and is
-// not within 60 seconds of expiry. Otherwise, fetches a new mandate from the
-// authority, validates it, caches it, and returns it.
+// GetOrFetch returns a cached mandate and its raw JSON bytes if it matches the quote key, JKT,
+// and is not within 60 seconds of expiry. Otherwise, fetches a new mandate from the
+// authority, validates it, caches it, and returns it with the raw bytes.
 func (c *MandateCache) GetOrFetch(
 	ctx context.Context,
 	qk QuoteKey,
@@ -59,7 +61,7 @@ func (c *MandateCache) GetOrFetch(
 	authority AuthorityClient,
 	clock Clock,
 	build func(QuoteKey) MandateInput,
-) (*Mandate, error) {
+) (*Mandate, json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -72,36 +74,37 @@ func (c *MandateCache) GetOrFetch(
 		if cached.quoteKey == qk &&
 			cached.mandate.JKT == ourJKT &&
 			now < cached.notAfterUnix-skewSecs {
-			return cached.mandate, nil
+			return cached.mandate, cached.rawBytes, nil
 		}
 	}
 
 	// Cache miss: fetch new mandate
 	input := build(qk)
-	mandate, err := authority.RequestMandate(ctx, input)
+	mandate, rawBytes, err := authority.RequestMandate(ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Validate the mandate
 	if err := Validate(mandate, qk, ourJKT, sellerANS, scopePrefix); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Parse not_after to get expiry time
 	notAfterTime, err := time.Parse(time.RFC3339, mandate.NotAfter)
 	if err != nil {
 		// This should not happen since Validate already checked it
-		return nil, err
+		return nil, nil, err
 	}
 	notAfterUnix := notAfterTime.Unix()
 
-	// Store in cache
+	// Store in cache with raw bytes
 	c.entry = &cachedMandate{
 		mandate:      mandate,
+		rawBytes:     rawBytes,
 		notAfterUnix: notAfterUnix,
 		quoteKey:     qk,
 	}
 
-	return mandate, nil
+	return mandate, rawBytes, nil
 }

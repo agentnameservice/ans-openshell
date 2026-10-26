@@ -27,7 +27,7 @@ func TestParseMandateResponse_Success(t *testing.T) {
 		}
 	}`
 
-	mandate, err := parseMandateResponse([]byte(responseBody))
+	mandate, rawBytes, err := parseMandateResponse([]byte(responseBody))
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -40,6 +40,12 @@ func TestParseMandateResponse_Success(t *testing.T) {
 	}
 	if mandate.JKT != "test-jkt-123" {
 		t.Errorf("expected jkt test-jkt-123, got %s", mandate.JKT)
+	}
+
+	// Verify raw bytes match the exact content[0].text
+	expectedRaw := `{"mandate_id":"mandate-123","quote_id":"quote-456","subject_ans":"ans://traveler.example.com","audience_ans":"ans://seller.example.com","scope":"commerce:travel:book","max_amount":500.0,"currency":"USD","not_before":"2026-10-20T10:00:00Z","not_after":"2026-10-20T11:00:00Z","jkt":"test-jkt-123","authority_ans":"ans://authority.example.com","signature":"sig-abc"}`
+	if string(rawBytes) != expectedRaw {
+		t.Errorf("raw bytes mismatch:\ngot:  %s\nwant: %s", string(rawBytes), expectedRaw)
 	}
 }
 
@@ -54,7 +60,7 @@ func TestParseMandateResponse_Error(t *testing.T) {
 		}
 	}`
 
-	mandate, err := parseMandateResponse([]byte(responseBody))
+	mandate, _, err := parseMandateResponse([]byte(responseBody))
 	if err == nil {
 		t.Fatalf("expected error, got mandate: %+v", mandate)
 	}
@@ -77,7 +83,7 @@ func TestParseMandateResponse_NoContent(t *testing.T) {
 		}
 	}`
 
-	mandate, err := parseMandateResponse([]byte(responseBody))
+	mandate, _, err := parseMandateResponse([]byte(responseBody))
 	if err == nil {
 		t.Fatalf("expected error for empty content, got mandate: %+v", mandate)
 	}
@@ -91,9 +97,52 @@ func TestParseMandateResponse_Malformed(t *testing.T) {
 	// Malformed JSON
 	responseBody := `{"invalid": "not a valid response"}`
 
-	mandate, err := parseMandateResponse([]byte(responseBody))
+	mandate, _, err := parseMandateResponse([]byte(responseBody))
 	if err == nil {
 		t.Fatalf("expected error for malformed response, got mandate: %+v", mandate)
+	}
+}
+
+func TestParseMandateResponse_PreservesFloatFormat(t *testing.T) {
+	// Test that max_amount with .0 is preserved in raw bytes
+	responseBody := `{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"result": {
+			"content": [
+				{
+					"type": "text",
+					"text": "{\"mandate_id\":\"m1\",\"quote_id\":\"q1\",\"subject_ans\":\"ans://traveler.example.com\",\"audience_ans\":\"ans://seller.example.com\",\"scope\":\"commerce:pay\",\"max_amount\":1000.0,\"currency\":\"USD\",\"not_before\":\"2026-01-01T00:00:00Z\",\"not_after\":\"2026-01-01T01:00:00Z\",\"jkt\":\"jkt1\",\"authority_ans\":\"ans://authority.example.com\",\"signature\":\"sig1\"}"
+				}
+			]
+		}
+	}`
+
+	mandate, rawBytes, err := parseMandateResponse([]byte(responseBody))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify the parsed mandate has the expected max_amount value
+	if mandate.MaxAmount != 1000.0 {
+		t.Errorf("expected max_amount 1000.0, got %v", mandate.MaxAmount)
+	}
+
+	// Verify raw bytes contain "max_amount":1000.0 (with .0)
+	if !strings.Contains(string(rawBytes), `"max_amount":1000.0`) {
+		t.Errorf("raw bytes should contain max_amount:1000.0 (with .0), got: %s", string(rawBytes))
+	}
+
+	// Verify that if we re-marshal the typed mandate, it would LOSE the .0
+	remarshaled, err := json.Marshal(mandate)
+	if err != nil {
+		t.Fatalf("failed to re-marshal mandate: %v", err)
+	}
+	if strings.Contains(string(remarshaled), `"max_amount":1000.0`) {
+		t.Errorf("re-marshaled mandate should NOT preserve .0 (proof the fix matters), got: %s", string(remarshaled))
+	}
+	if !strings.Contains(string(remarshaled), `"max_amount":1000`) {
+		t.Errorf("re-marshaled mandate should contain max_amount:1000 (without .0), got: %s", string(remarshaled))
 	}
 }
 
@@ -183,7 +232,7 @@ func TestHTTPAuthority_RequestMandate(t *testing.T) {
 			},
 		}
 
-		mandate, err := client.RequestMandate(context.Background(), input)
+		mandate, _, err := client.RequestMandate(context.Background(), input)
 		if err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
@@ -214,7 +263,7 @@ func TestHTTPAuthority_RequestMandate(t *testing.T) {
 			Currency: "USD",
 		}
 
-		mandate, err := client.RequestMandate(context.Background(), input)
+		mandate, _, err := client.RequestMandate(context.Background(), input)
 		if err == nil {
 			t.Fatalf("expected error for non-2xx, got mandate: %+v", mandate)
 		}

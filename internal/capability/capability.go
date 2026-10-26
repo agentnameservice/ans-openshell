@@ -61,10 +61,14 @@ const (
 // Outcome is the result of applying a Transform to a request.
 // Body is set only for Allow outcomes (the potentially modified request body).
 // Reason is set only for Deny outcomes (why the request was rejected).
+// SignURL, when non-empty on Allow, is the externally-visible URL the identity
+// proof's htu must bind, instead of the request target. Set by a transform that
+// rewrites the request toward an external endpoint (e.g. commerce → seller).
 type Outcome struct {
-	Kind   OutcomeKind
-	Body   []byte // Set only for Allow
-	Reason string // Set only for Deny
+	Kind    OutcomeKind
+	Body    []byte // Set only for Allow
+	Reason  string // Set only for Deny
+	SignURL string // Set only for Allow
 }
 
 // Target describes the request being evaluated: the destination (Host, Method, Path)

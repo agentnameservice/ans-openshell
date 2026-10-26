@@ -17,7 +17,7 @@ import (
 // panicAuthority panics if RequestMandate is called, proving the gate skipped.
 type panicAuthority struct{}
 
-func (panicAuthority) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, error) {
+func (panicAuthority) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, json.RawMessage, error) {
 	panic("RequestMandate called when gate should have skipped")
 }
 
@@ -407,15 +407,22 @@ qxLJH8nppWLHVdJvxMlvmJNLcQh3PRe6mXF1wnTvzWFhZj0c+0/qrjPd
 }
 
 type fakeAuthorityForCommerce struct {
-	mandate *commerce.Mandate
-	err     error
+	mandate  *commerce.Mandate
+	rawBytes json.RawMessage
+	err      error
 }
 
-func (f *fakeAuthorityForCommerce) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, error) {
+func (f *fakeAuthorityForCommerce) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, json.RawMessage, error) {
 	if f.err != nil {
-		return nil, f.err
+		return nil, nil, f.err
 	}
-	return f.mandate, nil
+	// If rawBytes not set, generate from mandate
+	raw := f.rawBytes
+	if raw == nil && f.mandate != nil {
+		rawData, _ := json.Marshal(f.mandate)
+		raw = json.RawMessage(rawData)
+	}
+	return f.mandate, raw, nil
 }
 
 type fakeClockForCommerce struct {
@@ -453,4 +460,84 @@ func (b *logBuffer) ContainsLevel(level string) bool {
 
 func (b *logBuffer) Contains(s string) bool {
 	return strings.Contains(b.String(), s)
+}
+
+func TestCommerce_SurfacesSignURL(t *testing.T) { //nolint:tparallel // subtests share rewriter state
+	t.Parallel()
+	// Test that commerce.Outcome.SignURL is mapped to capability.Outcome.SignURL.
+	key := loadCommerceTestKey(t)
+	mandate := &commerce.Mandate{
+		MandateID:    "mandate-001",
+		QuoteID:      "demo-quote-001",
+		SubjectANS:   "ans://traveler.example.com",
+		AudienceANS:  "ans://seller.skybound-travel.com",
+		Scope:        "commerce.payment:write",
+		MaxAmount:    1000.0,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://authority.example.com",
+		Signature:    "fake-signature",
+	}
+	fakeAuth := &fakeAuthorityForCommerce{mandate: mandate}
+	clock := fakeClockForCommerce{now: 1735689600}
+	nonce := &fakeNonceForCommerce{jti: "test-jti-123"}
+
+	deps := commerce.Deps{
+		Key:       key,
+		Cache:     commerce.NewMandateCache(),
+		Authority: fakeAuth,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+	cfg := commerce.Config{
+		SellerMCPURL: "https://seller.example.com/mcp/",
+		SellerANS:    "ans://seller.skybound-travel.com",
+		ScopePrefix:  "commerce.",
+		SubjectANS:   "ans://traveler.example.com",
+		MaxBodyBytes: 10000,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	rewriter := NewCommerceRewriter(deps, cfg, "seller.example.com", logger)
+
+	t.Run("SignURL matches SellerMCPURL", func(t *testing.T) {
+		req := capability.Requirement{
+			Capabilities: []capability.Capability{"mandate", "dpop_proof"},
+		}
+		body := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
+		target := makeTarget("seller.example.com", "POST", "/mcp/")
+
+		outcome := rewriter.Apply(context.Background(), target, req, body)
+
+		if outcome.Kind != capability.Allow {
+			t.Fatalf("outcome.Kind = %v, want Allow", outcome.Kind)
+		}
+
+		if outcome.SignURL != cfg.SellerMCPURL {
+			t.Errorf("outcome.SignURL = %q, want %q", outcome.SignURL, cfg.SellerMCPURL)
+		}
+	})
+
+	t.Run("SignURL matches discovered htu", func(t *testing.T) {
+		discoveredHtu := "https://other-seller.example.com/mcp/"
+		req := capability.Requirement{
+			Capabilities: []capability.Capability{"mandate", "dpop_proof"},
+			DPoP: &capability.DPoPParams{
+				Htu: discoveredHtu,
+			},
+		}
+		body := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
+		target := makeTarget("other-seller.example.com", "POST", "/mcp/")
+
+		outcome := rewriter.Apply(context.Background(), target, req, body)
+
+		if outcome.Kind != capability.Allow {
+			t.Fatalf("outcome.Kind = %v, want Allow", outcome.Kind)
+		}
+
+		if outcome.SignURL != discoveredHtu {
+			t.Errorf("outcome.SignURL = %q, want %q", outcome.SignURL, discoveredHtu)
+		}
+	})
 }
