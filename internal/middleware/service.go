@@ -94,16 +94,41 @@ type IdentityLookup interface {
 	Identity(name string) (*identity.Identity, bool)
 }
 
+// CommerceRewriter upgrades a recognized commerce call in place; nil disables it.
+type CommerceRewriter interface {
+	Rewrite(ctx context.Context, host, method, path string, body []byte) CommerceOutcome
+}
+
+// CommerceOutcome represents the result of a commerce rewrite operation.
+type CommerceOutcome struct {
+	Kind   CommerceKind
+	Body   []byte
+	Reason string
+}
+
+// CommerceKind represents the commerce decision.
+type CommerceKind int
+
+const (
+	// CommercePassthrough means the request was not a commerce call and should be forwarded as-is.
+	CommercePassthrough CommerceKind = iota
+	// CommerceDeny means the request was rejected by the commerce rewriter.
+	CommerceDeny
+	// CommerceAllow means the request was successfully rewritten with commerce data.
+	CommerceAllow
+)
+
 // Service implements openshell.middleware.v1.SupervisorMiddleware. The
 // WebSocket stream RPC is not implemented and the manifest does not advertise
 // it.
 type Service struct {
 	middlewarev1.UnimplementedSupervisorMiddlewareServer
-	ids   IdentityLookup
-	authz IdentityAuthorizer
-	vet   vetting.Verifier
-	cfg   Config
-	log   *slog.Logger
+	ids      IdentityLookup
+	authz    IdentityAuthorizer
+	vet      vetting.Verifier
+	cfg      Config
+	log      *slog.Logger
+	commerce CommerceRewriter
 }
 
 // NewService builds the service. vet may be nil when destination vetting is not
@@ -120,6 +145,12 @@ func NewService(ids IdentityLookup, authz IdentityAuthorizer, vet vetting.Verifi
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Service{ids: ids, authz: authz, vet: vet, cfg: cfg.withDefaults(), log: logger}
+}
+
+// WithCommerce injects a CommerceRewriter into the service.
+func (s *Service) WithCommerce(c CommerceRewriter) *Service {
+	s.commerce = c
+	return s
 }
 
 // Describe negotiates the protocol with the gateway and returns the manifest:
@@ -273,10 +304,31 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 	if !s.authz.Allows(req.GetContext().GetSandboxId(), policy.Identity) {
 		return out.deny(&denial{ReasonIdentityUnauthorized, "sandbox is not authorized to use the selected identity"})
 	}
-	if containsCredentialMarker(req.GetBody()) || containsCredentialMarker([]byte(req.GetTarget().GetPath())) {
+
+	// R1 pipeline: compute signBody, optionally rewrite via commerce, guard on rewritten bytes, then sign.
+	signBody := req.GetBody()
+
+	// Commerce rewrite stage (optional)
+	if s.commerce != nil {
+		outcome := s.commerce.Rewrite(ctx, req.GetTarget().GetHost(), method, req.GetTarget().GetPath(), signBody)
+		switch outcome.Kind {
+		case CommerceDeny:
+			return out.deny(&denial{ReasonCommerceDenied, "commerce rewrite denied: " + outcome.Reason})
+		case CommerceAllow:
+			signBody = outcome.Body
+			out.setBody(outcome.Body)
+		case CommercePassthrough:
+			// Leave signBody as the original
+		}
+	}
+
+	// Credential marker guard runs on signBody (post-rewrite bytes)
+	if containsCredentialMarker(signBody) || containsCredentialMarker([]byte(req.GetTarget().GetPath())) {
 		return out.deny(&denial{ReasonRequestRewriteUnsupported, "credential placeholders in a signed body or path require signing after credential rewriting"})
 	}
-	if d := s.attach(ctx, id, method, target, req.GetBody(), out); d != nil {
+
+	// Sign the (potentially rewritten) body
+	if d := s.attach(ctx, id, method, target, signBody, out); d != nil {
 		return out.deny(d)
 	}
 	return out.allow()
@@ -400,6 +452,8 @@ type outcome struct {
 	findings  []*middlewarev1.Finding
 	metadata  map[string]string
 	mutations []*middlewarev1.HeaderMutation
+	body      []byte
+	hasBody   bool
 }
 
 func (o *outcome) finding(typ, label, confidence, severity string) {
@@ -425,6 +479,11 @@ func (o *outcome) write(name, value string) {
 	})
 }
 
+func (o *outcome) setBody(b []byte) {
+	o.body = b
+	o.hasBody = true
+}
+
 // strip removes the identity headers and records the finding.
 func (o *outcome) strip() {
 	for _, name := range []string{pop.DPoPHeader, scitt.HeaderReceipt, scitt.HeaderStatusToken} {
@@ -436,12 +495,17 @@ func (o *outcome) strip() {
 }
 
 func (o *outcome) allow() *middlewarev1.HttpRequestResult {
-	return &middlewarev1.HttpRequestResult{
+	res := &middlewarev1.HttpRequestResult{
 		Decision:        middlewarev1.Decision_DECISION_ALLOW,
 		HeaderMutations: o.mutations,
 		Findings:        o.findings,
 		Metadata:        o.metadata,
 	}
+	if o.hasBody {
+		res.Body = o.body
+		res.HasBody = true
+	}
+	return res
 }
 
 func (o *outcome) deny(d *denial) *middlewarev1.HttpRequestResult {

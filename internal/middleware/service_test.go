@@ -548,7 +548,7 @@ func TestReasonCodeGrammar(t *testing.T) {
 	for _, code := range []string{
 		ReasonUnsupportedPhase, ReasonCallerUnauthenticated, ReasonCallerNotSupervisor, ReasonCallerSandboxMismatch,
 		ReasonPolicyInvalid, ReasonTargetInvalid, ReasonIdentityUnknown,
-		ReasonStatusTokenUnavailable, ReasonReceiptUnavailable, ReasonSignFailed,
+		ReasonStatusTokenUnavailable, ReasonReceiptUnavailable, ReasonSignFailed, ReasonCommerceDenied,
 		vetting.ReasonUnregistered, vetting.ReasonRevoked, vetting.ReasonUntrustedTL, vetting.ReasonBelowThreshold, vetting.ReasonUnverified,
 		FindingIdentityAttached, FindingIdentityStripped,
 	} {
@@ -557,5 +557,222 @@ func TestReasonCodeGrammar(t *testing.T) {
 	for _, st := range []vetting.Status{vetting.StatusUnknown, vetting.StatusRegistered, vetting.StatusUnregistered, vetting.StatusRevoked,
 		vetting.StatusUntrustedTL, vetting.StatusBelowThreshold, vetting.StatusError, vetting.StatusExempt} {
 		check(FindingDestinationPrefix + st.String())
+	}
+}
+
+// TestOutcome_AllowCarriesReplacementBody verifies that outcome.setBody causes
+// allow() to set HasBody=true and Body=<bytes>, and that bare allow() has HasBody=false.
+func TestOutcome_AllowCarriesReplacementBody(t *testing.T) {
+	t.Parallel()
+
+	// Test 1: setBody then allow should carry the body
+	o := &outcome{}
+	body := []byte("rewritten")
+	o.setBody(body)
+	res := o.allow()
+
+	if !res.GetHasBody() {
+		t.Errorf("allow() after setBody: HasBody = false, want true")
+	}
+	if !bytes.Equal(res.GetBody(), body) {
+		t.Errorf("allow() after setBody: Body = %q, want %q", res.GetBody(), body)
+	}
+
+	// Test 2: bare allow without setBody should have HasBody=false and nil Body
+	o2 := &outcome{}
+	res2 := o2.allow()
+
+	if res2.GetHasBody() {
+		t.Errorf("allow() without setBody: HasBody = true, want false")
+	}
+	if res2.GetBody() != nil {
+		t.Errorf("allow() without setBody: Body = %v, want nil", res2.GetBody())
+	}
+}
+
+// fakeCommerceRewriter is a stub commerce rewriter for testing.
+type fakeCommerceRewriter struct {
+	outcome CommerceOutcome
+}
+
+func (f *fakeCommerceRewriter) Rewrite(_ context.Context, _, _, _ string, _ []byte) CommerceOutcome {
+	return f.outcome
+}
+
+// TestEvaluate_CommerceRewriteThenSignRewrittenBody verifies that commerce rewrite
+// happens BEFORE signing, so the signed digest is sha256(rewritten), not sha256(original).
+func TestEvaluate_CommerceRewriteThenSignRewrittenBody(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1"}}}`)
+	rewritten := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1","mandate":"M1","dpop_proof":"P1"}}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	commerce := &fakeCommerceRewriter{
+		outcome: CommerceOutcome{Kind: CommerceAllow, Body: rewritten},
+	}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.commerce = commerce
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The signed digest must be sha256(rewritten), not sha256(original)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	// R1 proof: explicitly assert the digest is NOT sha256(original)
+	originalDigest := sha256.Sum256(original)
+	if signer.calls[0].digest == originalDigest {
+		t.Fatalf("signed digest equals sha256(original) — rewrite was not applied before signing")
+	}
+	// Now assert it IS sha256(rewritten)
+	wantDigest := sha256.Sum256(rewritten)
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of rewritten body)", signer.calls[0].digest, wantDigest)
+	}
+
+	// Result should carry the rewritten body
+	if !res.GetHasBody() {
+		t.Errorf("HasBody = false, want true")
+	}
+	if !bytes.Equal(res.GetBody(), rewritten) {
+		t.Errorf("Body = %q, want %q", res.GetBody(), rewritten)
+	}
+
+	// Should have the three identity headers
+	if len(res.GetHeaderMutations()) != 3 {
+		t.Errorf("header mutations = %d, want 3", len(res.GetHeaderMutations()))
+	}
+}
+
+// TestEvaluate_CommerceDenyShortCircuits verifies that commerce Deny returns
+// DECISION_DENY with reason_code ans_commerce_denied, with no Sign call and no body mutation.
+func TestEvaluate_CommerceDenyShortCircuits(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1"}}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	commerce := &fakeCommerceRewriter{
+		outcome: CommerceOutcome{Kind: CommerceDeny, Reason: "missing mandate"},
+	}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.commerce = commerce
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != deny {
+		t.Fatalf("decision = %v, want DENY", res.GetDecision())
+	}
+	if res.GetReasonCode() != ReasonCommerceDenied {
+		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonCommerceDenied)
+	}
+
+	// No Sign call should have happened
+	if len(signer.calls) != 0 {
+		t.Errorf("Sign calls = %d, want 0", len(signer.calls))
+	}
+
+	// No body mutation
+	if res.GetHasBody() {
+		t.Errorf("HasBody = true, want false")
+	}
+}
+
+// TestEvaluate_CommercePassthroughSignsOriginal verifies that commerce Passthrough
+// leaves the body unchanged, signs the original, and has HasBody=false.
+func TestEvaluate_CommercePassthroughSignsOriginal(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/other","params":{}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	commerce := &fakeCommerceRewriter{
+		outcome: CommerceOutcome{Kind: CommercePassthrough},
+	}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.commerce = commerce
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The signed digest must be sha256(original)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	wantDigest := sha256.Sum256(original)
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of original body)", signer.calls[0].digest, wantDigest)
+	}
+
+	// HasBody should be false (no body replacement)
+	if res.GetHasBody() {
+		t.Errorf("HasBody = true, want false")
+	}
+}
+
+// TestEvaluate_CredentialMarkerInRewrittenBodyDenied verifies that the credential
+// marker guard runs on the POST-rewrite body, so a rewrite cannot smuggle a marker past it.
+func TestEvaluate_CredentialMarkerInRewrittenBodyDenied(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"book_flight"}}`)
+	// Rewritten body contains the credential marker
+	rewritten := []byte(`{"method":"tools/call","params":{"name":"book_flight","secret":"openshell:resolve:env:API_KEY"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	commerce := &fakeCommerceRewriter{
+		outcome: CommerceOutcome{Kind: CommerceAllow, Body: rewritten},
+	}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.commerce = commerce
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != deny {
+		t.Fatalf("decision = %v, want DENY", res.GetDecision())
+	}
+	if res.GetReasonCode() != ReasonRequestRewriteUnsupported {
+		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonRequestRewriteUnsupported)
+	}
+
+	// No Sign call should have happened (guard runs before attach)
+	if len(signer.calls) != 0 {
+		t.Errorf("Sign calls = %d, want 0", len(signer.calls))
 	}
 }

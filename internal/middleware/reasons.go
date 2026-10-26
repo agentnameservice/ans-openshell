@@ -36,6 +36,8 @@ const (
 	ReasonIdentityUnauthorized = "ans_identity_unauthorized"
 	// ReasonRequestRewriteUnsupported denies content OpenShell could rewrite after signing.
 	ReasonRequestRewriteUnsupported = "ans_credential_rewrite_unsupported"
+	// ReasonCommerceDenied is returned when the commerce rewriter denies a request.
+	ReasonCommerceDenied = "ans_commerce_denied"
 	// ReasonStatusTokenUnavailable is returned when the identity has no
 	// unexpired status token (ANS-6 section 9.4, fail closed).
 	ReasonStatusTokenUnavailable = "ans_status_token_unavailable"

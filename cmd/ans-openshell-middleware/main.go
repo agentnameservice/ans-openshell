@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
+	"github.com/agentnameservice/ans-openshell/internal/commerce"
+	"github.com/agentnameservice/ans-openshell/internal/commercekey"
 	"github.com/agentnameservice/ans-openshell/internal/config"
 	"github.com/agentnameservice/ans-openshell/internal/extauth"
 	"github.com/agentnameservice/ans-openshell/internal/grpcserver"
@@ -52,6 +56,8 @@ type fileConfig struct {
 	// MaxPayloadBytes and RequestTimeout are advertised in the manifest binding.
 	MaxPayloadBytes uint64        `yaml:"max_payload_bytes"`
 	RequestTimeout  time.Duration `yaml:"request_timeout"`
+	// Commerce enables commerce rewriting for Tier 2 demo.
+	Commerce config.Commerce `yaml:"commerce"`
 }
 
 func main() {
@@ -144,11 +150,72 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 		return err
 	}
 	svc := middleware.NewService(registry, authz, vet, serviceConfig(cfg), logger)
+
+	// Wire commerce if enabled
+	if cfg.Commerce.Enabled() {
+		rewriter, startPrefetch, err := setupCommerce(cfg, logger)
+		if err != nil {
+			return err
+		}
+		svc.WithCommerce(rewriter)
+		if startPrefetch != nil {
+			startPrefetch()
+		}
+		logger.InfoContext(ctx, "commerce rewriter enabled")
+	}
+
 	middlewarev1.RegisterSupervisorMiddlewareServer(srv.Registrar(), svc)
 	go srv.WatchReadiness(ctx, healthCheckInterval, readinessProbe(ctx, registry, auth, logger))
 	logger.InfoContext(ctx, "ans-openshell-middleware starting",
-		"version", version, "identities", registry.Names(), "vetting", vet != nil)
+		"version", version, "identities", registry.Names(), "vetting", vet != nil, "commerce", cfg.Commerce.Enabled())
 	return srv.Serve(ctx)
+}
+
+// setupCommerce builds the commerce rewriter and returns an optional demo-prefetch closure.
+func setupCommerce(cfg fileConfig, logger *slog.Logger) (middleware.CommerceRewriter, func(), error) {
+	if err := cfg.Commerce.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("commerce config: %w", err)
+	}
+	keyPath := cfg.Commerce.CommerceDPoPKeyPath
+	if keyPath == "" {
+		keyPath = os.Getenv("COMMERCE_DPOP_KEY")
+	}
+	key, err := commercekey.Load(keyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("commerce key: %w", err)
+	}
+	cache := commerce.NewMandateCache()
+	authority := commerce.NewHTTPAuthority(cfg.Commerce.AuthorityMCPURL)
+	clock := realClock{}
+	nonce := &uuidNonce{}
+	deps := commerce.Deps{
+		Key:       key,
+		Cache:     cache,
+		Authority: authority,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+	commerceCfg := commerce.Config{
+		SellerMCPURL: cfg.Commerce.SellerMCPURL,
+		SellerANS:    cfg.Commerce.SellerANS,
+		ScopePrefix:  cfg.Commerce.ScopeHint,
+		SubjectANS:   cfg.Commerce.SubjectANS,
+		MaxBodyBytes: cfg.Commerce.MaxBodyBytes,
+	}
+	sellerHost, err := middleware.ParseSellerHost(cfg.Commerce.SellerMCPURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("commerce seller host: %w", err)
+	}
+	rewriter := middleware.NewCommerceRewriter(deps, commerceCfg, sellerHost)
+
+	// Return optional demo-prefetch closure if demo fields are set
+	var prefetch func()
+	if cfg.Commerce.DemoQuoteID != "" && cfg.Commerce.DemoAmount > 0 && cfg.Commerce.DemoCurrency != "" {
+		prefetch = func() {
+			go prefetchDemoMandate(cache, key, cfg.Commerce, authority, clock, logger)
+		}
+	}
+	return rewriter, prefetch, nil
 }
 
 // serviceConfig maps the file configuration onto the middleware service.
@@ -209,4 +276,64 @@ func (h healthState) level() slog.Level {
 		return slog.LevelInfo
 	}
 	return slog.LevelWarn
+}
+
+// realClock implements commerce.Clock using time.Now().
+type realClock struct{}
+
+func (realClock) NowUnix() int64 { return time.Now().Unix() }
+
+// uuidNonce implements commerce.Nonce using crypto/rand.
+type uuidNonce struct{}
+
+func (u *uuidNonce) JTI() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		panic("crypto/rand.Read failed: " + err.Error())
+	}
+	// UUID v4 format: set version (4) and variant (10b)
+	const (
+		uuidVersion4    = 0x40
+		uuidVariant     = 0x80
+		uuidVersionMask = 0x0f
+		uuidVariantMask = 0x3f
+	)
+	buf[6] = (buf[6] & uuidVersionMask) | uuidVersion4
+	buf[8] = (buf[8] & uuidVariantMask) | uuidVariant
+	return hex.EncodeToString(buf[:])
+}
+
+// prefetchDemoMandate warms the mandate cache with a demo quote in the background.
+func prefetchDemoMandate(cache *commerce.MandateCache, key *commercekey.Key, cfg config.Commerce,
+	authority commerce.AuthorityClient, clock commerce.Clock, logger *slog.Logger) {
+	qk := commerce.QuoteKey{
+		QuoteID:  cfg.DemoQuoteID,
+		Amount:   cfg.DemoAmount,
+		Currency: cfg.DemoCurrency,
+	}
+	_, err := cache.GetOrFetch(
+		context.Background(), //nolint:contextcheck // Prefetch uses background context after server started
+		qk,
+		key.JKT(),
+		cfg.SellerANS,
+		cfg.ScopeHint,
+		authority,
+		clock,
+		func(qk commerce.QuoteKey) commerce.MandateInput {
+			return commerce.MandateInput{
+				QuoteID:         qk.QuoteID,
+				Total:           qk.Amount,
+				Currency:        qk.Currency,
+				MerchantANS:     cfg.SellerANS,
+				ScopeHint:       cfg.ScopeHint,
+				SubjectANS:      cfg.SubjectANS,
+				TravelerDPoPJWK: key.PublicJWK(),
+			}
+		},
+	)
+	if err != nil {
+		logger.WarnContext(context.Background(), "demo mandate prefetch failed", "error", err)
+	} else {
+		logger.InfoContext(context.Background(), "demo mandate prefetched", "quote_id", cfg.DemoQuoteID)
+	}
 }
