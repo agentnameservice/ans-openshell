@@ -1,0 +1,41 @@
+# ans-openshell-middleware --config middleware-agent-a.yaml
+# Agent A: Registered buyer identity with commerce enabled for Tier 2 demo
+listen: ":50051"
+health_listen: ":8091"
+tls:
+  cert_file: /etc/ans-openshell/tls/tls.crt
+  key_file: /etc/ans-openshell/tls/tls.key
+auth:
+  gateway_issuer: openshell-gateway:prod-1
+  audience: urn:openshell:extension:middleware:ans
+  jwks_file: /etc/ans-openshell/gateway-jwks.json
+  jwks_url: https://openshell-gateway.openshell.svc/.well-known/jwks.json
+transparency_log:
+  base_url: https://transparency.ans.godaddy.com
+  root_keys_file: /etc/ans-openshell/tl-root-keys.txt
+identities:
+  buyer-agent:
+    ans_name: ans://v2.0.0.buyer.example.com
+    agent_id: 00000000-0000-0000-0000-000000000000
+    key_file: /.secrets/example.com/key.pem
+    cert_file: /.secrets/example.com/cert.pem
+    dev_mode: false
+sandbox_identities: {}
+vetting:
+  trusted_tl_domains: [transparency.ans.godaddy.com]
+  cache_ttl: 10m
+  request_budget: 150ms
+  exempt_hosts: ["api.openai.com", "*.amazonaws.com"]
+max_payload_bytes: 262144
+commerce:
+  seller_mcp_url: https://seller.skybound-travel.com/mcp/
+  authority_mcp_url: https://authority.skybound-travel.com/mcp/
+  seller_ans: ans://v1.0.8.seller.skybound-travel.com
+  authority_ans: ans://v1.0.8.authority.skybound-travel.com
+  scope_hint: purchase:flight:demo
+  subject_ans: ans://v2.0.0.buyer.example.com
+  commerce_dpop_key_path: /.secrets/example.com/commerce-dpop.pem
+  demo_quote_id: demo-quote-001
+  demo_amount: 500
+  demo_currency: USD
+  max_body_bytes: 10000

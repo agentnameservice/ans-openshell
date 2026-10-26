@@ -41,3 +41,9 @@ Thumbs.db
 *.pem
 *.key
 *.csr
+
+# Identity material for the Tier 2 demo (Agent A bundle, commerce key) — never committed
+/.secrets/
+
+# Design docs, plans, and runbooks are local-only (user instruction: ignore docs folder)
+/docs/

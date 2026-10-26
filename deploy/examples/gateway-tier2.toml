@@ -1,0 +1,16 @@
+# OpenShell gateway Tier 2 demo configuration.
+# Two-agent egress demo: agent A (commerce) and agent B (dev-mode rogue).
+
+[[openshell.supervisor.middleware]]
+name = "ans-egress-a"
+grpc_endpoint = "http://<HOST_IP>:50051"
+allow_insecure_transport = true
+max_payload_bytes = 262144
+timeout = "5s"
+
+[[openshell.supervisor.middleware]]
+name = "ans-egress-b"
+grpc_endpoint = "http://<HOST_IP>:50052"
+allow_insecure_transport = true
+max_payload_bytes = 262144
+timeout = "5s"

@@ -1,0 +1,27 @@
+# ans-openshell-middleware --config middleware-agent-b.yaml
+# Agent B: Dev-mode self-signed rogue identity with no commerce for Tier 2 demo
+listen: ":50052"
+health_listen: ":8092"
+tls:
+  cert_file: /etc/ans-openshell/tls/tls.crt
+  key_file: /etc/ans-openshell/tls/tls.key
+auth:
+  gateway_issuer: openshell-gateway:prod-1
+  audience: urn:openshell:extension:middleware:ans
+  jwks_file: /etc/ans-openshell/gateway-jwks.json
+  jwks_url: https://openshell-gateway.openshell.svc/.well-known/jwks.json
+transparency_log:
+  base_url: https://transparency.ans.godaddy.com
+  root_keys_file: /etc/ans-openshell/tl-root-keys.txt
+identities:
+  rogue-agent:
+    ans_name: ans://v9.9.9.rogue.example
+    agent_id: f7b8c9d0-e1f2-4a3b-9c8d-7e6f5a4b3c2d
+    dev_mode: true
+sandbox_identities: {}
+vetting:
+  trusted_tl_domains: [transparency.ans.godaddy.com]
+  cache_ttl: 10m
+  request_budget: 150ms
+  exempt_hosts: ["api.openai.com", "*.amazonaws.com"]
+max_payload_bytes: 262144
