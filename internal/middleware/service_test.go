@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"log/slog"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,6 +21,9 @@ import (
 
 	"github.com/agentnameservice/ans-openshell/gen/openshell/extensionv1"
 	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
+	"github.com/agentnameservice/ans-openshell/internal/capability"
+	"github.com/agentnameservice/ans-openshell/internal/commerce"
+	"github.com/agentnameservice/ans-openshell/internal/commercekey"
 	"github.com/agentnameservice/ans-openshell/internal/extauth"
 	"github.com/agentnameservice/ans-openshell/internal/identity"
 	"github.com/agentnameservice/ans-openshell/internal/vetting"
@@ -188,14 +192,23 @@ func TestDescribe(t *testing.T) {
 				len(ext.GetSupportedCapabilities()) != 1 || ext.GetSupportedCapabilities()[0] != CapabilityContract {
 				t.Fatalf("extension metadata = %v", ext)
 			}
-			if len(m.GetBindings()) != 1 {
-				t.Fatalf("bindings = %v", m.GetBindings())
+			if len(m.GetBindings()) != 2 {
+				t.Fatalf("bindings = %v, want 2", m.GetBindings())
 			}
+			// First binding: HTTP_REQUEST / PRE_CREDENTIALS
 			b := m.GetBindings()[0]
 			if b.GetOperation() != middlewarev1.SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST ||
 				b.GetPhase() != preCredentials || b.GetMaxPayloadBytes() != DefaultMaxPayloadBytes ||
 				b.GetRequestTimeout().AsDuration() != cfg.RequestTimeout {
-				t.Fatalf("binding = %v", b)
+				t.Fatalf("request binding = %v", b)
+			}
+			// Second binding: HTTP_RESPONSE / PRE_RETURN
+			rb := m.GetBindings()[1]
+			if rb.GetOperation() != middlewarev1.SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE ||
+				rb.GetPhase() != middlewarev1.SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN ||
+				rb.GetMaxPayloadBytes() != DefaultMaxPayloadBytes ||
+				rb.GetRequestTimeout().AsDuration() != cfg.RequestTimeout {
+				t.Fatalf("response binding = %v", rb)
 			}
 		})
 	}
@@ -207,7 +220,10 @@ func TestDescribe(t *testing.T) {
 			t.Fatal(err)
 		}
 		if m.GetBindings()[0].GetRequestTimeout() != nil {
-			t.Fatalf("request_timeout = %v, want unset", m.GetBindings()[0].GetRequestTimeout())
+			t.Fatalf("request binding request_timeout = %v, want unset", m.GetBindings()[0].GetRequestTimeout())
+		}
+		if m.GetBindings()[1].GetRequestTimeout() != nil {
+			t.Fatalf("response binding request_timeout = %v, want unset", m.GetBindings()[1].GetRequestTimeout())
 		}
 	})
 }
@@ -548,7 +564,7 @@ func TestReasonCodeGrammar(t *testing.T) {
 	for _, code := range []string{
 		ReasonUnsupportedPhase, ReasonCallerUnauthenticated, ReasonCallerNotSupervisor, ReasonCallerSandboxMismatch,
 		ReasonPolicyInvalid, ReasonTargetInvalid, ReasonIdentityUnknown,
-		ReasonStatusTokenUnavailable, ReasonReceiptUnavailable, ReasonSignFailed, ReasonCommerceDenied,
+		ReasonStatusTokenUnavailable, ReasonReceiptUnavailable, ReasonSignFailed, ReasonRewriteDenied,
 		vetting.ReasonUnregistered, vetting.ReasonRevoked, vetting.ReasonUntrustedTL, vetting.ReasonBelowThreshold, vetting.ReasonUnverified,
 		FindingIdentityAttached, FindingIdentityStripped,
 	} {
@@ -590,17 +606,9 @@ func TestOutcome_AllowCarriesReplacementBody(t *testing.T) {
 	}
 }
 
-// fakeCommerceRewriter is a stub commerce rewriter for testing.
-type fakeCommerceRewriter struct {
-	outcome CommerceOutcome
-}
-
-func (f *fakeCommerceRewriter) Rewrite(_ context.Context, _, _, _ string, _ []byte) CommerceOutcome {
-	return f.outcome
-}
-
 // TestEvaluate_CommerceRewriteThenSignRewrittenBody verifies that commerce rewrite
 // happens BEFORE signing, so the signed digest is sha256(rewritten), not sha256(original).
+// This test uses the new transform chain (commerce as a Transform).
 func TestEvaluate_CommerceRewriteThenSignRewrittenBody(t *testing.T) {
 	t.Parallel()
 
@@ -611,12 +619,10 @@ func TestEvaluate_CommerceRewriteThenSignRewrittenBody(t *testing.T) {
 	id := newIdentity(t, testIdentity, signer, fullArtifacts())
 	ids := lookup{testIdentity: id}
 
-	commerce := &fakeCommerceRewriter{
-		outcome: CommerceOutcome{Kind: CommerceAllow, Body: rewritten},
-	}
+	transform := &stubTransform{kind: capability.Allow, body: rewritten}
 
 	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
-	s.commerce = commerce
+	s.AddTransform(transform)
 
 	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
 	if err != nil {
@@ -657,7 +663,8 @@ func TestEvaluate_CommerceRewriteThenSignRewrittenBody(t *testing.T) {
 }
 
 // TestEvaluate_CommerceDenyShortCircuits verifies that commerce Deny returns
-// DECISION_DENY with reason_code ans_commerce_denied, with no Sign call and no body mutation.
+// DECISION_DENY with reason_code ans_rewrite_denied (was ans_commerce_denied), with no Sign call and no body mutation.
+// This test uses the new transform chain.
 func TestEvaluate_CommerceDenyShortCircuits(t *testing.T) {
 	t.Parallel()
 
@@ -667,12 +674,10 @@ func TestEvaluate_CommerceDenyShortCircuits(t *testing.T) {
 	id := newIdentity(t, testIdentity, signer, fullArtifacts())
 	ids := lookup{testIdentity: id}
 
-	commerce := &fakeCommerceRewriter{
-		outcome: CommerceOutcome{Kind: CommerceDeny, Reason: "missing mandate"},
-	}
+	transform := &stubTransform{kind: capability.Deny, reason: "missing mandate"}
 
 	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
-	s.commerce = commerce
+	s.AddTransform(transform)
 
 	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), body))
 	if err != nil {
@@ -682,8 +687,9 @@ func TestEvaluate_CommerceDenyShortCircuits(t *testing.T) {
 	if res.GetDecision() != deny {
 		t.Fatalf("decision = %v, want DENY", res.GetDecision())
 	}
-	if res.GetReasonCode() != ReasonCommerceDenied {
-		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonCommerceDenied)
+	// ReasonCommerceDenied is now an alias for ReasonRewriteDenied
+	if res.GetReasonCode() != ReasonRewriteDenied {
+		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonRewriteDenied)
 	}
 
 	// No Sign call should have happened
@@ -699,6 +705,7 @@ func TestEvaluate_CommerceDenyShortCircuits(t *testing.T) {
 
 // TestEvaluate_CommercePassthroughSignsOriginal verifies that commerce Passthrough
 // leaves the body unchanged, signs the original, and has HasBody=false.
+// This test uses the new transform chain.
 func TestEvaluate_CommercePassthroughSignsOriginal(t *testing.T) {
 	t.Parallel()
 
@@ -708,12 +715,10 @@ func TestEvaluate_CommercePassthroughSignsOriginal(t *testing.T) {
 	id := newIdentity(t, testIdentity, signer, fullArtifacts())
 	ids := lookup{testIdentity: id}
 
-	commerce := &fakeCommerceRewriter{
-		outcome: CommerceOutcome{Kind: CommercePassthrough},
-	}
+	transform := &stubTransform{kind: capability.Passthrough}
 
 	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
-	s.commerce = commerce
+	s.AddTransform(transform)
 
 	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
 	if err != nil {
@@ -740,7 +745,8 @@ func TestEvaluate_CommercePassthroughSignsOriginal(t *testing.T) {
 }
 
 // TestEvaluate_CredentialMarkerInRewrittenBodyDenied verifies that the credential
-// marker guard runs on the POST-rewrite body, so a rewrite cannot smuggle a marker past it.
+// marker guard runs on the POST-chain body, so a transform cannot smuggle a marker past it.
+// This test uses the new transform chain.
 func TestEvaluate_CredentialMarkerInRewrittenBodyDenied(t *testing.T) {
 	t.Parallel()
 
@@ -752,12 +758,10 @@ func TestEvaluate_CredentialMarkerInRewrittenBodyDenied(t *testing.T) {
 	id := newIdentity(t, testIdentity, signer, fullArtifacts())
 	ids := lookup{testIdentity: id}
 
-	commerce := &fakeCommerceRewriter{
-		outcome: CommerceOutcome{Kind: CommerceAllow, Body: rewritten},
-	}
+	transform := &stubTransform{kind: capability.Allow, body: rewritten}
 
 	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
-	s.commerce = commerce
+	s.AddTransform(transform)
 
 	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
 	if err != nil {
@@ -775,4 +779,477 @@ func TestEvaluate_CredentialMarkerInRewrittenBodyDenied(t *testing.T) {
 	if len(signer.calls) != 0 {
 		t.Errorf("Sign calls = %d, want 0", len(signer.calls))
 	}
+}
+
+// stubTransform is a test stub implementing capability.Transform.
+type stubTransform struct {
+	kind   capability.OutcomeKind
+	body   []byte
+	reason string
+	called *bool
+}
+
+func (s *stubTransform) Provides() []capability.Capability {
+	return nil
+}
+
+func (s *stubTransform) Apply(_ context.Context, _ capability.Target, _ capability.Requirement, _ []byte) capability.Outcome {
+	if s.called != nil {
+		*s.called = true
+	}
+	return capability.Outcome{
+		Kind:   s.kind,
+		Body:   s.body,
+		Reason: s.reason,
+	}
+}
+
+// TestEvaluate_ChainComposesThenSigns verifies that multiple Allow transforms
+// compose (each sees the previous rewritten body) and the final composed body is signed.
+func TestEvaluate_ChainComposesThenSigns(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"test"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// Two transforms: A appends "A", B appends "B"
+	transformA := &stubTransform{kind: capability.Allow, body: []byte("A")}
+	transformB := &stubTransform{kind: capability.Allow, body: []byte("AB")}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.AddTransform(transformA).AddTransform(transformB)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The signed digest must be sha256("AB"), not sha256(original)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	originalDigest := sha256.Sum256(original)
+	if signer.calls[0].digest == originalDigest {
+		t.Fatalf("signed digest equals sha256(original) — chain was not applied")
+	}
+	wantDigest := sha256.Sum256([]byte("AB"))
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of final composed body)", signer.calls[0].digest, wantDigest)
+	}
+
+	// Result should carry the final body
+	if !res.GetHasBody() {
+		t.Errorf("HasBody = false, want true")
+	}
+	if !bytes.Equal(res.GetBody(), []byte("AB")) {
+		t.Errorf("Body = %q, want %q", res.GetBody(), "AB")
+	}
+}
+
+// TestEvaluate_TransformDenyShortCircuits verifies that a Deny transform
+// returns DECISION_DENY with reason_code ans_rewrite_denied, with no Sign call,
+// and the second transform is NOT invoked.
+func TestEvaluate_TransformDenyShortCircuits(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"method":"tools/call","params":{"name":"test"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// First transform denies, second should not be called
+	var secondCalled bool
+	transformDeny := &stubTransform{kind: capability.Deny, reason: "test denial"}
+	transformSecond := &stubTransform{kind: capability.Allow, body: []byte("should-not-run"), called: &secondCalled}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.AddTransform(transformDeny).AddTransform(transformSecond)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != deny {
+		t.Fatalf("decision = %v, want DENY", res.GetDecision())
+	}
+	if res.GetReasonCode() != ReasonRewriteDenied {
+		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonRewriteDenied)
+	}
+
+	// No Sign call should have happened
+	if len(signer.calls) != 0 {
+		t.Errorf("Sign calls = %d, want 0", len(signer.calls))
+	}
+
+	// Second transform should NOT have been called
+	if secondCalled {
+		t.Errorf("second transform was called, want it to be skipped after Deny")
+	}
+}
+
+// TestEvaluate_NoTransformsSignsOriginal verifies that when no transforms are registered,
+// the original body is signed, HasBody=false, and the result is byte-identical to pre-change behavior.
+func TestEvaluate_NoTransformsSignsOriginal(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"test"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// No transforms registered (empty rewriters, nil discoverer)
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The signed digest must be sha256(original)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	wantDigest := sha256.Sum256(original)
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of original body)", signer.calls[0].digest, wantDigest)
+	}
+
+	// HasBody should be false (no body replacement)
+	if res.GetHasBody() {
+		t.Errorf("HasBody = true, want false")
+	}
+}
+
+// TestEvaluate_PassthroughContinues verifies that a Passthrough transform
+// allows the next transform to run and modify the body.
+func TestEvaluate_PassthroughContinues(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"test"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// First transform passes through, second allows with body change
+	var secondCalled bool
+	transformPassthrough := &stubTransform{kind: capability.Passthrough}
+	transformAllow := &stubTransform{kind: capability.Allow, body: []byte("modified"), called: &secondCalled}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.AddTransform(transformPassthrough).AddTransform(transformAllow)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// Second transform should have run
+	if !secondCalled {
+		t.Errorf("second transform was not called, want it to run after Passthrough")
+	}
+
+	// Body should be from the second transform
+	if !res.GetHasBody() {
+		t.Errorf("HasBody = false, want true")
+	}
+	if !bytes.Equal(res.GetBody(), []byte("modified")) {
+		t.Errorf("Body = %q, want %q", res.GetBody(), "modified")
+	}
+
+	// Signed digest should be sha256("modified")
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	wantDigest := sha256.Sum256([]byte("modified"))
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of modified body)", signer.calls[0].digest, wantDigest)
+	}
+}
+
+// TestEvaluate_CredentialMarkerOnFinalBytes verifies that the credential marker
+// guard runs on the POST-chain bytes, so a transform cannot smuggle a marker past it.
+func TestEvaluate_CredentialMarkerOnFinalBytes(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"test"}}`)
+	// Rewritten body contains the credential marker
+	rewritten := []byte(`{"method":"tools/call","params":{"name":"test","secret":"openshell:resolve:env:API_KEY"}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	transform := &stubTransform{kind: capability.Allow, body: rewritten}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.AddTransform(transform)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != deny {
+		t.Fatalf("decision = %v, want DENY", res.GetDecision())
+	}
+	if res.GetReasonCode() != ReasonRequestRewriteUnsupported {
+		t.Errorf("reason_code = %q, want %q", res.GetReasonCode(), ReasonRequestRewriteUnsupported)
+	}
+
+	// No Sign call should have happened (guard runs before attach)
+	if len(signer.calls) != 0 {
+		t.Errorf("Sign calls = %d, want 0", len(signer.calls))
+	}
+}
+
+// stubDiscoverer implements capability.Discoverer.
+type stubDiscoverer struct {
+	req capability.Requirement
+}
+
+func (s stubDiscoverer) Discover(_ context.Context, _ capability.Target) capability.Requirement {
+	return s.req
+}
+
+// TestEvaluate_E2E_DiscoveryDrivesCommerce verifies that the discovered Requirement
+// drives the commerce transform: a registered discoverer returns the seller Requirement,
+// the commerce transform receives it and rewrites the body, and the final result has
+// the rewritten body signed with 3 identity headers.
+func TestEvaluate_E2E_DiscoveryDrivesCommerce(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1"}}}`)
+	rewritten := []byte(`{"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"Q1","mandate":"M1","dpop_proof":"P1"}}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// Stub discoverer returns a Requirement with capabilities + DPoP htu
+	sellerReq := capability.Requirement{
+		Tool:         "book_flight",
+		Capabilities: []capability.Capability{"mandate", "dpop_proof"},
+		DPoP: &capability.DPoPParams{
+			Htu: "https://seller.example.com/mcp/",
+		},
+	}
+	discoverer := stubDiscoverer{req: sellerReq}
+
+	// Stub transform mimics commerce rewriter: receives Requirement, returns rewritten body
+	transform := &stubTransform{kind: capability.Allow, body: rewritten}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, nil)
+	s.WithDiscoverer(discoverer)
+	s.AddTransform(transform)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), evaluation(t, signPolicy(), original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The signed digest must be sha256(rewritten)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+	wantDigest := sha256.Sum256(rewritten)
+	if signer.calls[0].digest != wantDigest {
+		t.Errorf("signed digest = %x, want %x (sha256 of rewritten body)", signer.calls[0].digest, wantDigest)
+	}
+
+	// Result should carry the rewritten body
+	if !res.GetHasBody() {
+		t.Errorf("HasBody = false, want true")
+	}
+	if !bytes.Equal(res.GetBody(), rewritten) {
+		t.Errorf("Body = %q, want %q", res.GetBody(), rewritten)
+	}
+
+	// Should have the three identity headers
+	if len(res.GetHeaderMutations()) != 3 {
+		t.Errorf("header mutations = %d, want 3", len(res.GetHeaderMutations()))
+	}
+}
+
+// TestEvaluate_E2E_DiscoveryEmptyStaticFallback verifies that when discovery returns
+// an empty Requirement, the commerce transform's lenient fallback still rewrites the body
+// for a seller host/POST/path match, and a WARN is logged.
+func TestEvaluate_E2E_DiscoveryEmptyStaticFallback(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500.0,"currency":"USD"}}}`)
+
+	signer := &fakeSigner{}
+	id := newIdentity(t, testIdentity, signer, fullArtifacts())
+	ids := lookup{testIdentity: id}
+
+	// Stub discoverer returns empty Requirement (discovery failed)
+	discoverer := stubDiscoverer{req: capability.Requirement{}}
+
+	// Load a real commerce key for the commerce rewriter
+	tempPEM := `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEjRWeJA0VniQNFZ4
+kDRWeJA0VniQNFZ4kDRWeJA0VnihRANCAAR7VJCMjvKZnHnHvS3xdKaPXM5pHvEJ
+qxLJH8nppWLHVdJvxMlvmJNLcQh3PRe6mXF1wnTvzWFhZj0c+0/qrjPd
+-----END PRIVATE KEY-----`
+	tmpfile := t.TempDir() + "/test.pem"
+	if err := os.WriteFile(tmpfile, []byte(tempPEM), 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := commercekey.Load(tmpfile)
+	if err != nil {
+		t.Fatalf("failed to load test key: %v", err)
+	}
+
+	// Create commerce stubs (fakes from commerce/cache_test.go patterns)
+	cache := commerce.NewMandateCache()
+	authority := &fakeCommerceAuthority{mandate: &commerce.Mandate{
+		MandateID:    "mandate-e2e-test",
+		QuoteID:      "demo-quote-001",
+		SubjectANS:   "ans://v2.0.0.buyer.example.com",
+		AudienceANS:  "ans://v1.0.8.seller.example.com",
+		Scope:        "purchase:flight:demo",
+		MaxAmount:    500.0,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://v1.0.8.authority.example.com",
+		Signature:    "fake-signature-e2e",
+	}}
+	clock := fakeCommerceClock{now: 1735689600}
+	nonce := &fakeCommerceNonce{jti: "test-jti"}
+
+	deps := commerce.Deps{
+		Key:       key,
+		Cache:     cache,
+		Authority: authority,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+	cfg := commerce.Config{
+		SellerMCPURL: "https://seller.example.com/mcp/",
+		SellerANS:    "ans://v1.0.8.seller.example.com",
+		ScopePrefix:  "purchase:flight:demo",
+		SubjectANS:   "ans://v2.0.0.buyer.example.com",
+		MaxBodyBytes: 100000,
+	}
+
+	// Capture logs to verify WARN
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	handler := slog.NewTextHandler(&syncLogWriter{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(handler)
+
+	// Use the REAL NewCommerceRewriter
+	transform := NewCommerceRewriter(deps, cfg, "seller.example.com", logger)
+
+	// Set up the target to match seller host + POST + /mcp/ (fallback trigger)
+	policy := map[string]any{"identity": testIdentity}
+	eval := &middlewarev1.HttpRequestEvaluation{
+		Phase:   preCredentials,
+		Context: &middlewarev1.RequestContext{RequestId: "req-1", SandboxId: testSandbox},
+		Config:  structOf(t, policy),
+		Target: &middlewarev1.HttpRequestTarget{
+			Scheme: "https", Host: "seller.example.com", Port: 443, Method: "POST", Path: "/mcp/", Query: "",
+		},
+		Headers: []*middlewarev1.HttpHeader{},
+		Body:    original,
+	}
+
+	s := NewService(ids, sandboxAuthorizer(testSandbox), nil, Config{}, logger)
+	s.WithDiscoverer(discoverer)
+	s.AddTransform(transform)
+
+	res, err := s.EvaluateHttpRequest(t.Context(), eval)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.GetDecision() != allow {
+		t.Fatalf("decision = %v, want ALLOW", res.GetDecision())
+	}
+
+	// The body should be rewritten (fallback path)
+	if !res.GetHasBody() {
+		t.Errorf("HasBody = false, want true (fallback should rewrite)")
+	}
+
+	// The signed digest must be sha256(rewritten)
+	if len(signer.calls) != 1 {
+		t.Fatalf("Sign calls = %d, want 1", len(signer.calls))
+	}
+
+	// Verify the WARN was logged with "commerce static fallback"
+	mu.Lock()
+	logs := buf.String()
+	mu.Unlock()
+	if !strings.Contains(logs, "commerce static fallback") {
+		t.Errorf("logs do not contain 'commerce static fallback' WARN; got: %q", logs)
+	}
+}
+
+// syncLogWriter wraps a bytes.Buffer with mutex for race-free log capture.
+type syncLogWriter struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (sw *syncLogWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+// fakeCommerceClock implements commerce.Clock for testing.
+type fakeCommerceClock struct {
+	now int64
+}
+
+func (f fakeCommerceClock) NowUnix() int64 {
+	return f.now
+}
+
+// fakeCommerceNonce implements commerce.Nonce for testing.
+type fakeCommerceNonce struct {
+	jti string
+}
+
+func (f *fakeCommerceNonce) JTI() string {
+	return f.jti
+}
+
+// fakeCommerceAuthority implements commerce.AuthorityClient for testing.
+type fakeCommerceAuthority struct {
+	mandate *commerce.Mandate
+	err     error
+}
+
+func (f *fakeCommerceAuthority) RequestMandate(_ context.Context, _ commerce.MandateInput) (*commerce.Mandate, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.mandate, nil
 }

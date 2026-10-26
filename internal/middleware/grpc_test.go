@@ -45,7 +45,7 @@ func TestGRPCContract(t *testing.T) {
 
 	m, err := client.Describe(ctx, &middlewarev1.MiddlewareDescribeRequest{
 		Gateway: &extensionv1.PeerMetadata{ProtocolVersion: &extensionv1.ProtocolVersion{Major: 1}}})
-	if err != nil || m.GetName() != ManifestName || len(m.GetBindings()) != 1 {
+	if err != nil || m.GetName() != ManifestName || len(m.GetBindings()) != 2 {
 		t.Fatalf("Describe() = %v, %v", m, err)
 	}
 	_, err = client.Describe(ctx, &middlewarev1.MiddlewareDescribeRequest{

@@ -270,4 +270,42 @@ max_body_bytes: 10000
 			t.Errorf("Validate() = %v for complete config", err)
 		}
 	})
+
+	t.Run("DiscoveryTTL field parses", func(t *testing.T) {
+		yml := `
+seller_mcp_url: https://seller.example.com/mcp/
+authority_mcp_url: https://authority.example.com/mcp/
+seller_ans: ans://v1.0.8.seller.skybound-travel.com
+authority_ans: ans://v1.0.8.authority.skybound-travel.com
+scope_hint: purchase:flight:demo
+subject_ans: ans://v2.0.0.buyer.example.com
+commerce_dpop_key_path: /path/to/key.json
+discovery_ttl: 5m
+`
+		var c Commerce
+		if err := Parse([]byte(yml), &c); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if c.DiscoveryTTL != 5*time.Minute {
+			t.Errorf("DiscoveryTTL = %v, want 5m", c.DiscoveryTTL)
+		}
+
+		// Test omitted field yields zero
+		yml2 := `
+seller_mcp_url: https://seller.example.com/mcp/
+authority_mcp_url: https://authority.example.com/mcp/
+seller_ans: ans://v1.0.8.seller.skybound-travel.com
+authority_ans: ans://v1.0.8.authority.skybound-travel.com
+scope_hint: purchase:flight:demo
+subject_ans: ans://v2.0.0.buyer.example.com
+commerce_dpop_key_path: /path/to/key.json
+`
+		var c2 Commerce
+		if err := Parse([]byte(yml2), &c2); err != nil {
+			t.Fatalf("unmarshal without discovery_ttl: %v", err)
+		}
+		if c2.DiscoveryTTL != 0 {
+			t.Errorf("DiscoveryTTL = %v, want 0 when omitted", c2.DiscoveryTTL)
+		}
+	})
 }

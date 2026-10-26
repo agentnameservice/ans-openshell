@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
+	"github.com/agentnameservice/ans-openshell/internal/capability"
 	"github.com/agentnameservice/ans-openshell/internal/commerce"
 	"github.com/agentnameservice/ans-openshell/internal/commercekey"
 	"github.com/agentnameservice/ans-openshell/internal/config"
@@ -153,11 +155,20 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 
 	// Wire commerce if enabled
 	if cfg.Commerce.Enabled() {
-		rewriter, startPrefetch, err := setupCommerce(cfg, logger)
+		transform, startPrefetch, err := setupCommerce(cfg, logger)
 		if err != nil {
 			return err
 		}
-		svc.WithCommerce(rewriter)
+
+		// Wire the discoverer (no I/O at startup; discovery happens per-request)
+		ttl := cfg.Commerce.DiscoveryTTL
+		if ttl == 0 {
+			ttl = 10 * time.Minute //nolint:mnd // default TTL for agent-card/tools-list discovery cache
+		}
+		client := &http.Client{Timeout: 10 * time.Second} //nolint:mnd // discovery fetch timeout
+		svc.WithDiscoverer(capability.NewHTTPDiscoverer(client, ttl))
+
+		svc.AddTransform(transform)
 		if startPrefetch != nil {
 			startPrefetch()
 		}
@@ -165,14 +176,16 @@ func serve(ctx context.Context, cfg fileConfig, logger *slog.Logger) error {
 	}
 
 	middlewarev1.RegisterSupervisorMiddlewareServer(srv.Registrar(), svc)
+	middlewarev1.RegisterHttpResponsePreReturnServer(srv.Registrar(), middleware.NewPreReturnService(logger))
+	logger.InfoContext(ctx, "http response pre-return stage enabled")
 	go srv.WatchReadiness(ctx, healthCheckInterval, readinessProbe(ctx, registry, auth, logger))
 	logger.InfoContext(ctx, "ans-openshell-middleware starting",
 		"version", version, "identities", registry.Names(), "vetting", vet != nil, "commerce", cfg.Commerce.Enabled())
 	return srv.Serve(ctx)
 }
 
-// setupCommerce builds the commerce rewriter and returns an optional demo-prefetch closure.
-func setupCommerce(cfg fileConfig, logger *slog.Logger) (middleware.CommerceRewriter, func(), error) {
+// setupCommerce builds the commerce transform and returns an optional demo-prefetch closure.
+func setupCommerce(cfg fileConfig, logger *slog.Logger) (capability.Transform, func(), error) {
 	if err := cfg.Commerce.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("commerce config: %w", err)
 	}
@@ -206,7 +219,7 @@ func setupCommerce(cfg fileConfig, logger *slog.Logger) (middleware.CommerceRewr
 	if err != nil {
 		return nil, nil, fmt.Errorf("commerce seller host: %w", err)
 	}
-	rewriter := middleware.NewCommerceRewriter(deps, commerceCfg, sellerHost)
+	rewriter := middleware.NewCommerceRewriter(deps, commerceCfg, sellerHost, logger)
 
 	// Return optional demo-prefetch closure if demo fields are set
 	var prefetch func()

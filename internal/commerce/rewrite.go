@@ -58,12 +58,14 @@ type Outcome struct {
 //   - Passthrough (no deps called) if: body is not JSON, method != "tools/call", or params.name != "book_flight"
 //   - Extract quote_id, amount, currency from params.arguments; missing → Deny
 //   - Fetch mandate from cache (with validation); error → Deny
-//   - Mint DPoP proof with htu = cfg.SellerMCPURL (verbatim, not reconstructed)
+//   - Mint DPoP proof with htu = htuOverride (if set), else cfg.SellerMCPURL (verbatim, not reconstructed)
 //   - Splice mandate and dpop_proof into arguments, re-marshal
 //   - If re-marshaled body exceeds cfg.MaxBodyBytes → Deny; else Allow
 //
+// htuOverride: when non-empty, use this as the DPoP htu instead of cfg.SellerMCPURL (for discovered params).
+//
 // CRITICAL: Uses json.Decoder.UseNumber() to preserve numeric formatting (500 stays 500, not 500.0).
-func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config) Outcome {
+func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config, htuOverride string) Outcome {
 	// Parse the body with UseNumber() to preserve numeric formatting
 	// CRITICAL: Must use json.Decoder with UseNumber() to prevent 500 → 500.0 conversion
 	var req map[string]any
@@ -153,8 +155,12 @@ func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config) Out
 	}
 
 	// Mint DPoP proof
-	// CRITICAL: htu is cfg.SellerMCPURL verbatim (trailing slash preserved), not reconstructed
-	proof, err := MintDPoP(d.Key, cfg.SellerMCPURL, quoteID, d.Clock.NowUnix(), d.Nonce.JTI())
+	// CRITICAL: htu is htuOverride (if set) or cfg.SellerMCPURL (trailing slash preserved), not reconstructed
+	htu := cfg.SellerMCPURL
+	if htuOverride != "" {
+		htu = htuOverride
+	}
+	proof, err := MintDPoP(d.Key, htu, quoteID, d.Clock.NowUnix(), d.Nonce.JTI())
 	if err != nil {
 		return Outcome{Kind: Deny, Reason: fmt.Sprintf("dpop mint error: %v", err)}
 	}

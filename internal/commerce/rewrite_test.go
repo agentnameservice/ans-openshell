@@ -2,6 +2,7 @@ package commerce
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"strings"
@@ -58,7 +59,7 @@ func TestRewrite_PassthroughNonJSON(t *testing.T) {
 	deps := Deps{}
 	cfg := Config{}
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Passthrough {
 		t.Errorf("expected Passthrough, got %v", outcome.Kind)
@@ -73,7 +74,7 @@ func TestRewrite_PassthroughNotBookFlight(t *testing.T) {
 	deps := Deps{}
 	cfg := Config{}
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Passthrough {
 		t.Errorf("expected Passthrough, got %v", outcome.Kind)
@@ -89,7 +90,7 @@ func TestRewrite_DenyMissingArgs(t *testing.T) {
 	deps := Deps{}
 	cfg := Config{}
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Deny {
 		t.Errorf("expected Deny, got %v", outcome.Kind)
@@ -144,7 +145,7 @@ func TestRewrite_AllowSplicesMandateAndProof(t *testing.T) {
 
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Allow {
 		t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
@@ -254,7 +255,7 @@ func TestRewrite_DenyOversize(t *testing.T) {
 
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Deny {
 		t.Errorf("expected Deny for oversize, got %v", outcome.Kind)
@@ -267,6 +268,122 @@ func TestRewrite_DenyOversize(t *testing.T) {
 	if !strings.Contains(outcome.Reason, "oversize") && !strings.Contains(outcome.Reason, "size") {
 		t.Errorf("expected reason to mention size, got %q", outcome.Reason)
 	}
+}
+
+func TestRewrite_HtuOverride(t *testing.T) {
+	// Test that htuOverride is used for DPoP htu when set, else static cfg.SellerMCPURL.
+	key := loadRewriteTestKey(t)
+	mandate := &Mandate{
+		MandateID:    "mandate-001",
+		QuoteID:      "demo-quote-001",
+		SubjectANS:   "ans://traveler.example.com",
+		AudienceANS:  "ans://seller.skybound-travel.com",
+		Scope:        "commerce.payment:write",
+		MaxAmount:    1000.0,
+		Currency:     "USD",
+		NotBefore:    "2026-01-01T00:00:00Z",
+		NotAfter:     "2026-12-31T23:59:59Z",
+		JKT:          key.JKT(),
+		AuthorityANS: "ans://authority.example.com",
+		Signature:    "fake-signature",
+	}
+
+	fakeAuth := &fakeAuthorityWithError{mandate: mandate}
+	clock := fakeClock{now: 1735689600}
+	nonce := &fakeNonce{jti: "test-jti-123"}
+
+	deps := Deps{
+		Key:       key,
+		Cache:     NewMandateCache(),
+		Authority: fakeAuth,
+		Clock:     clock,
+		Nonce:     nonce,
+	}
+
+	cfg := Config{
+		SellerMCPURL: "https://seller.skybound-travel.com/mcp/",
+		SellerANS:    "ans://seller.skybound-travel.com",
+		ScopePrefix:  "commerce.",
+		SubjectANS:   "ans://traveler.example.com",
+		MaxBodyBytes: 10000,
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
+
+	t.Run("with override", func(t *testing.T) {
+		override := "https://other-seller.example.com/mcp/"
+		outcome := RewriteBookFlight(context.Background(), body, deps, cfg, override)
+
+		if outcome.Kind != Allow {
+			t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+		}
+
+		// Decode dpop_proof and check htu == override
+		var result map[string]any
+		if err := json.Unmarshal(outcome.Body, &result); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+		params := result["params"].(map[string]any)
+		args := params["arguments"].(map[string]any)
+		dpopProof := args["dpop_proof"].(string)
+
+		parts := strings.Split(dpopProof, ".")
+		if len(parts) != 3 {
+			t.Fatalf("expected 3-part JWS, got %d parts", len(parts))
+		}
+		var claims map[string]any
+		if err := json.Unmarshal(mustBase64Decode(parts[1]), &claims); err != nil {
+			t.Fatalf("unmarshal claims: %v", err)
+		}
+		htu, ok := claims["htu"].(string)
+		if !ok {
+			t.Fatal("htu not found in claims")
+		}
+		if htu != override {
+			t.Errorf("htu = %q, want %q", htu, override)
+		}
+	})
+
+	t.Run("without override", func(t *testing.T) {
+		outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
+
+		if outcome.Kind != Allow {
+			t.Fatalf("expected Allow, got %v: %s", outcome.Kind, outcome.Reason)
+		}
+
+		// Decode dpop_proof and check htu == cfg.SellerMCPURL
+		var result map[string]any
+		if err := json.Unmarshal(outcome.Body, &result); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+		params := result["params"].(map[string]any)
+		args := params["arguments"].(map[string]any)
+		dpopProof := args["dpop_proof"].(string)
+
+		parts := strings.Split(dpopProof, ".")
+		if len(parts) != 3 {
+			t.Fatalf("expected 3-part JWS, got %d parts", len(parts))
+		}
+		var claims map[string]any
+		if err := json.Unmarshal(mustBase64Decode(parts[1]), &claims); err != nil {
+			t.Fatalf("unmarshal claims: %v", err)
+		}
+		htu, ok := claims["htu"].(string)
+		if !ok {
+			t.Fatal("htu not found in claims")
+		}
+		if htu != cfg.SellerMCPURL {
+			t.Errorf("htu = %q, want %q", htu, cfg.SellerMCPURL)
+		}
+	})
+}
+
+func mustBase64Decode(s string) []byte {
+	data, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
 
 func TestRewrite_DenyOnMandateError(t *testing.T) {
@@ -296,7 +413,7 @@ func TestRewrite_DenyOnMandateError(t *testing.T) {
 
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"book_flight","arguments":{"quote_id":"demo-quote-001","amount":500,"currency":"USD"}}}`)
 
-	outcome := RewriteBookFlight(context.Background(), body, deps, cfg)
+	outcome := RewriteBookFlight(context.Background(), body, deps, cfg, "")
 
 	if outcome.Kind != Deny {
 		t.Errorf("expected Deny on mandate error, got %v", outcome.Kind)

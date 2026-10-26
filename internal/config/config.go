@@ -142,6 +142,8 @@ type Commerce struct {
 	DemoCurrency string `yaml:"demo_currency"`
 	// MaxBodyBytes is the maximum body size after rewriting.
 	MaxBodyBytes int `yaml:"max_body_bytes"`
+	// DiscoveryTTL is the agent-card/tools-list discovery cache TTL; 0 means the default.
+	DiscoveryTTL time.Duration `yaml:"discovery_ttl"`
 }
 
 // Enabled reports whether commerce is configured.
