@@ -153,6 +153,13 @@ func TestClassifyActivityRouting(t *testing.T) {
 		{"websocket coverage", Event{ClassUID: 4001, ActivityID: 99, ActionID: 1, DispositionID: 1, Message: "WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected"}, classifiedActivity{Diagnostic: "coverage"}},
 		{"coverage metadata before class routing", Event{ClassUID: 4001, ActivityID: 1, ActionID: 1, DispositionID: 1, Unmapped: json.RawMessage(`{"coverage_state":"binding_not_selected"}`)}, classifiedActivity{Diagnostic: "coverage"}},
 		{"invalid coverage metadata", Event{ClassUID: 4001, ActivityID: 1, ActionID: 1, DispositionID: 1, Unmapped: json.RawMessage(`{"coverage_state":[]}`)}, classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}},
+		{"coverage metadata on a denied decision", Event{ClassUID: 4002, ActivityID: 99, ActionID: 2, DispositionID: 2, Message: "L7_REQUEST deny POST example.com:443/upload reason=rule", Unmapped: json.RawMessage(`{"coverage_state":"binding_not_selected"}`)}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"operational status on a websocket decision", Event{ClassUID: 4001, ActivityID: 99, ActionID: 2, DispositionID: 2, StatusDetail: "assembly_capacity_exhausted", Message: "WEBSOCKET_L7_REQUEST deny WEBSOCKET_TEXT example.com:443/ws reason=rule"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"operational status on a rewrite decision", Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, StatusDetail: "credential_unavailable", Message: "L7_REQUEST_TRANSFORMED allow POST example.com:443/mcp reason=rule"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"coverage metadata on a connection denial", Event{ClassUID: 4001, ActivityID: 1, ActionID: 2, DispositionID: 2, Message: "CONNECT denied example.com:443 reason=rule", Unmapped: json.RawMessage(`{"coverage_state":"binding_not_selected"}`)}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"operational status on a transparent denial", Event{ClassUID: 4001, ActivityID: 1, ActionID: 2, DispositionID: 2, StatusDetail: "assembly_capacity_exhausted", Message: "Transparent TCP denied example.com:443"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"connection failure carrying a websocket denial", Event{ClassUID: 4001, ActivityID: 4, Message: "WEBSOCKET_L7_REQUEST deny WEBSOCKET_TEXT example.com:443/ws reason=rule"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"connection failure carrying a connect decision", Event{ClassUID: 4001, ActivityID: 4, Message: "CONNECT allowed example.com:443"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
 		{"middleware allow", Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Message: "MIDDLEWARE content remote decision=Allow", Unmapped: json.RawMessage(`{"failed":false}`)}, classifiedActivity{Diagnostic: "middleware_stage"}},
 		{"middleware denied", Event{ClassUID: 4002, ActivityID: 99, ActionID: 2, DispositionID: 2, Message: "MIDDLEWARE content remote decision=Deny", Unmapped: json.RawMessage(`{"failed":false}`)}, classifiedActivity{Diagnostic: "unclassified_middleware_denial", Incomplete: true}},
 		{"middleware failed closed", Event{ClassUID: 4002, ActivityID: 99, ActionID: 2, DispositionID: 2, Message: "MIDDLEWARE content remote decision=Deny", Unmapped: json.RawMessage(`{"failed":true}`)}, classifiedActivity{Diagnostic: "middleware_failure"}},
@@ -171,6 +178,8 @@ func TestClassifyActivityRouting(t *testing.T) {
 		{"non-object unmapped metadata", Event{ClassUID: 4002, ActivityID: 99, Message: "L7_REQUEST allow GET example.com:443/test", Unmapped: json.RawMessage(`[]`)}, classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}},
 		{"irrelevant class", Event{ClassUID: ClassProcessActivity, ActivityID: 1, Message: "process start"}, classifiedActivity{Diagnostic: "other"}},
 		{"empty event", Event{}, classifiedActivity{Diagnostic: "other"}},
+		{"lifecycle record carrying a connect denial", Event{ClassUID: 4001, ActivityID: 3, Message: "CONNECT denied example.com:443"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
+		{"irrelevant class carrying a transparent denial", Event{ClassUID: ClassProcessActivity, ActivityID: 1, Message: "Transparent TCP denied example.com:443"}, classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -180,6 +189,85 @@ func TestClassifyActivityRouting(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fuzzActivityEvent builds a classifier input from fuzzed choices, biased
+// toward the classes, activities, statuses and message families the rules read.
+func fuzzActivityEvent(class, activity, action, disposition, status, family, metadata uint8, suffix string) Event {
+	classes := [...]int{ClassHTTPActivity, ClassNetworkActivity, ClassProcessActivity, ClassDetectionFinding, 0}
+	activities := [...]int{0, networkActivityOpen, 2, 3, networkActivityFail, networkActivityTraffic, policyActivityOther}
+	enums := [...]int{0, 1, deniedID, observedActionID, policyActivityOther}
+	statuses := [...]string{"", "credential_endpoint_mismatch", "request_authority_mismatch", "credential_unavailable",
+		"assembly_capacity_exhausted", "policy_dns_trusted_gateway_unavailable", "policy_dns_ineligible",
+		"transparent_tcp_allowed", "transparent_tcp_policy_denied", "transparent_tcp_mapping_expired"}
+	families := [...]string{"", "L7_REQUEST ", "GRAPHQL_L7_REQUEST ", "JSONRPC_L7_REQUEST ", "JSONRPC_L7_REQUEST decision=",
+		"L7_REQUEST_TRANSFORMED ", "WEBSOCKET_L7_REQUEST ", "CONNECT ", "CONNECT_L7 ", "CONNECT denied ", "Transparent TCP ",
+		"Transparent TCP denied ", "MIDDLEWARE ", "WEBSOCKET_MIDDLEWARE ", "WEBSOCKET_MIDDLEWARE_COVERAGE ",
+		"WEBSOCKET_CREDENTIAL_REWRITE ", "HTTP_REQUEST ", "Policy DNS refused ", "Supervisor session established",
+		"Proxy connection error: "}
+	metadatas := [...]string{"", `{"coverage_state":"binding_not_selected"}`, `{"coverage_state":""}`, `{"failed":true}`,
+		`{"failed":"maybe"}`, `{"middleware":"guard","count":1}`, `not json`}
+	return Event{
+		ClassUID:      classes[int(class)%len(classes)],
+		ActivityID:    activities[int(activity)%len(activities)],
+		ActionID:      enums[int(action)%len(enums)],
+		DispositionID: enums[int(disposition)%len(enums)],
+		StatusDetail:  statuses[int(status)%len(statuses)],
+		Message:       families[int(family)%len(families)] + suffix,
+		Unmapped:      json.RawMessage(metadatas[int(metadata)%len(metadatas)]),
+	}
+}
+
+// statedDecision reports whether a message states an L7 or connection policy
+// decision, and which one. It is written independently of the classifier.
+func statedDecision(ev Event) (policyDecision, bool) {
+	tokens := strings.Fields(ev.Message)
+	if len(tokens) > 0 {
+		switch tokens[0] {
+		case "L7_REQUEST", "GRAPHQL_L7_REQUEST", "JSONRPC_L7_REQUEST", "L7_REQUEST_TRANSFORMED", "WEBSOCKET_L7_REQUEST":
+			if len(tokens) == 1 {
+				return decisionUnknown, true
+			}
+			return activityDecision(strings.TrimPrefix(tokens[1], "decision=")), true
+		case "CONNECT", "CONNECT_L7":
+			if len(tokens) > 1 && (tokens[1] == "allowed" || tokens[1] == "denied") {
+				return policyDecision(tokens[1]), true
+			}
+		}
+	}
+	switch {
+	case strings.HasPrefix(ev.Message, "Transparent TCP denied"):
+		return decisionDenied, true
+	case strings.HasPrefix(ev.Message, "Transparent TCP ") && ev.StatusDetail == "transparent_tcp_allowed":
+		return decisionAllowed, true
+	default:
+		return "", false
+	}
+}
+
+func FuzzClassifyActivityKeepsStatedDecisions(f *testing.F) {
+	f.Add(uint8(1), uint8(1), uint8(2), uint8(2), uint8(0), uint8(9), uint8(1), "example.com:443")
+	f.Add(uint8(1), uint8(4), uint8(0), uint8(0), uint8(0), uint8(6), uint8(0), "deny WEBSOCKET_TEXT example.com:443/ws reason=rule")
+	f.Add(uint8(0), uint8(6), uint8(2), uint8(2), uint8(3), uint8(1), uint8(0), "deny POST example.com:443/upload reason=rule")
+	f.Add(uint8(1), uint8(3), uint8(0), uint8(0), uint8(0), uint8(11), uint8(0), "example.com:443")
+	f.Add(uint8(2), uint8(1), uint8(0), uint8(0), uint8(7), uint8(10), uint8(0), "mapping_id=placeholder")
+	f.Fuzz(func(t *testing.T, class, activity, action, disposition, status, family, metadata uint8, suffix string) {
+		ev := fuzzActivityEvent(class, activity, action, disposition, status, family, metadata, suffix)
+		if ev.ClassUID == ClassDetectionFinding {
+			return
+		}
+		stated, states := statedDecision(ev)
+		if !states {
+			return
+		}
+		got := classifyActivity(ev)
+		if got.Group == "" && !got.Incomplete {
+			t.Fatalf("stated %q decision dropped: %+v -> %+v", stated, ev, got)
+		}
+		if stated == decisionDenied && got.Group != "" && got.Decision != decisionDenied && got.Decision != decisionUnknown {
+			t.Fatalf("stated denial counted as %s: %+v", got.Decision, ev)
+		}
+	})
 }
 
 func TestClassifyActivityFindings(t *testing.T) {
@@ -295,8 +383,11 @@ func TestActivityReaderInvalidOCSF(t *testing.T) {
 		{"malformed object", `{"class_uid":`, 1},
 		{"malformed indented object", `  {not JSON}`, 1},
 		{"wrong type in object", `{"class_uid":"4001"}`, 1},
-		{"bad stderr payload", `timestamp OCSF-JSON []`, 1},
+		{"bad stderr payload", `timestamp OCSF-JSON {"class_uid":"4001"}`, 1},
 		{"missing stderr payload", `timestamp OCSF-JSON`, 1},
+		{"non-object stderr payload", `timestamp OCSF-JSON []`, 0},
+		{"marker text inside plain stderr", `CONNECT allowed OCSF-JSON.attacker.example:443`, 0},
+		{"marker as a word in plain stderr", `WARN failed to encode OCSF-JSON payload`, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

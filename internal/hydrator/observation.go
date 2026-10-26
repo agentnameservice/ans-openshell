@@ -93,6 +93,14 @@ type ProtocolAdherenceValue struct {
 	SampleSize  int     `json:"sampleSize"`
 }
 
+// ActivityScoreValue is the value of the activity signal: the generic numeric
+// score format of the Trust Index reference implementation. It carries no
+// provider risk codes.
+type ActivityScoreValue struct {
+	Score       int    `json:"score"`
+	Explanation string `json:"explanation"`
+}
+
 func newProvenance(aimID, evidenceURL string) *Provenance {
 	if aimID == "" && evidenceURL == "" {
 		return nil
@@ -143,6 +151,15 @@ func (b observationBuilder) observation(agentID, signalID string, value any) (Ob
 		Value:      raw,
 		Provenance: b.provenance,
 	}, nil
+}
+
+// activity returns the activity observation for evidence that carries a score.
+func (b observationBuilder) activity(agentID string, evidence ActivityEvidence) (Observation, error) {
+	if evidence.Score == nil {
+		return Observation{}, fmt.Errorf("hydrator: activity evidence for agent %s has no score", agentID)
+	}
+	value := ActivityScoreValue{Score: *evidence.Score, Explanation: activityExplanation(evidence)}
+	return b.observation(agentID, b.signals.ActivityID, value)
 }
 
 func (b observationBuilder) policyViolationRate(st *agentStats) PolicyViolationRateValue {

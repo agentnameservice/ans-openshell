@@ -5,9 +5,20 @@ import (
 	"math"
 )
 
+// Unavailable reasons recorded in ActivityEvidence.Unavailable.
 const (
-	activityIncomplete     = "interpretation_incomplete"
-	activityDedupSaturated = "dedup_saturated"
+	activityIncomplete          = "interpretation_incomplete"
+	activityDedupSaturated      = "dedup_saturated"
+	activityUnreadableRecords   = "unreadable_audit_records"
+	activityInsufficientSample  = "insufficient_sample"
+	activityNoEligibleDecisions = "no_eligible_decisions"
+)
+
+// activityDNSRefused is the diagnostic that feeds the DNS-to-TCP denial
+// coverage check, so producer and consumer must agree on it.
+const activityDNSRefused = "dns_refused"
+
+const (
 	activityOther          = "other"
 	defaultMinDecisions    = 1
 	defaultMaxUIDsPerAgent = 100_000
@@ -40,6 +51,15 @@ func (m ActivityMeasurements) groups() []DecisionCounts {
 	return []DecisionCounts{m.HTTPInitial, m.PostRewriteEvaluations, m.WebSocketEvaluations, m.Connections}
 }
 
+// Denied returns the denied policy decisions across all measurement groups.
+func (m ActivityMeasurements) Denied() int {
+	denied := 0
+	for _, counts := range m.groups() {
+		denied += counts.Denied
+	}
+	return denied
+}
+
 func assessActivity(m ActivityMeasurements, minimum int, unavailable string) (*int, string, int) {
 	sample := 0
 	for _, counts := range m.groups() {
@@ -60,7 +80,7 @@ func assessActivity(m ActivityMeasurements, minimum int, unavailable string) (*i
 		}
 		if n < minimum {
 			if counts.Denied+counts.Audited > 0 {
-				return nil, "insufficient_sample", sample
+				return nil, activityInsufficientSample, sample
 			}
 			continue
 		}
@@ -68,7 +88,7 @@ func assessActivity(m ActivityMeasurements, minimum int, unavailable string) (*i
 		lowest = min(lowest, fullAdherence*float64(counts.Allowed)/float64(n))
 	}
 	if !eligible {
-		return nil, "no_eligible_decisions", sample
+		return nil, activityNoEligibleDecisions, sample
 	}
 	score := int(math.Round(lowest))
 	return &score, "", sample

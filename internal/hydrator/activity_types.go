@@ -67,3 +67,15 @@ type ActivityEvidence struct {
 	Score          *int                 `json:"score"`
 	Unavailable    string               `json:"unavailableReason,omitempty"`
 }
+
+// Degraded reports whether the score was withheld because the agent's records
+// could not be interpreted or counted, as opposed to there being too few
+// policy decisions to measure.
+func (e ActivityEvidence) Degraded() bool {
+	switch e.Unavailable {
+	case "", activityInsufficientSample, activityNoEligibleDecisions:
+		return false
+	default:
+		return true
+	}
+}

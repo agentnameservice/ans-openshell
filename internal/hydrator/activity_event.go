@@ -49,6 +49,17 @@ type classifiedActivity struct {
 	AuditFallback bool
 }
 
+// activityRecord is a policy-relevant event with its unmapped fields decoded
+// and its message split into tokens once.
+type activityRecord struct {
+	Event
+	unmapped map[string]json.RawMessage
+	tokens   []string
+}
+
+// activityRule classifies a record it recognizes and reports false otherwise.
+type activityRule func(activityRecord) (classifiedActivity, bool)
+
 func classifyActivity(ev Event) classifiedActivity {
 	unmapped, valid := activityUnmapped(ev.Unmapped)
 	if ev.ClassUID == ClassDetectionFinding {
@@ -57,20 +68,61 @@ func classifyActivity(ev Event) classifiedActivity {
 	if !valid {
 		return classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}
 	}
-	if raw, present := unmapped["coverage_state"]; present {
-		var state string
-		if json.Unmarshal(raw, &state) != nil || state == "" {
-			return classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}
+	record := activityRecord{Event: ev, unmapped: unmapped, tokens: strings.Fields(ev.Message)}
+	result := classifyPolicyRecord(record)
+	if result.Group == "" && !result.Incomplete && record.statesDecision() {
+		return classifiedActivity{Diagnostic: "conflicting_decision_metadata", Incomplete: true}
+	}
+	return result
+}
+
+// classifyPolicyRecord applies the first rule that recognizes the record.
+// Record metadata comes first because OpenShell sets it on records that are not
+// policy evaluations. Message families that never state a decision follow, then
+// network records identified by activity, then decision messages, and finally
+// connection decisions with a class-based fallback. classifyActivity rejects
+// any uncounted result whose message states a decision, so rule order can make
+// an agent incomplete but cannot hide a decision.
+func classifyPolicyRecord(record activityRecord) classifiedActivity {
+	rules := [...]activityRule{
+		classifyCoverageMetadata,
+		classifyStatusDetail,
+		classifyHTTPMiddleware,
+		classifyWebSocketMiddleware,
+		classifyPassthroughHTTP,
+		classifyWebSocketNotice,
+		classifySession,
+		classifyConnectionFailure,
+		classifyDNSTraffic,
+		classifyL7Decision,
+	}
+	for _, rule := range rules {
+		if result, ok := rule(record); ok {
+			return result
 		}
-		return classifiedActivity{Diagnostic: "coverage"}
 	}
-	if result, ok := classifyActivityDiagnostic(ev, unmapped); ok {
-		return result
+	return classifyConnectionActivity(record)
+}
+
+// statesDecision reports whether the message has the shape of an L7 or
+// connection policy decision, judged by its leading tokens.
+func (r activityRecord) statesDecision() bool {
+	if _, isL7 := l7DecisionGroup(r.tokens); isL7 {
+		return true
 	}
-	if result, ok := classifyL7Activity(ev); ok {
-		return result
+	if len(r.tokens) >= 2 && (r.tokens[0] == "CONNECT" || r.tokens[0] == "CONNECT_L7") {
+		return r.tokens[1] == "allowed" || r.tokens[1] == "denied"
 	}
-	return classifyConnectionActivity(ev)
+	return strings.HasPrefix(r.Message, "Transparent TCP denied") ||
+		strings.HasPrefix(r.Message, "Transparent TCP ") && r.StatusDetail == "transparent_tcp_allowed"
+}
+
+func (r activityRecord) withoutDecisionEnums() bool {
+	return r.ActionID == 0 && r.DispositionID == 0
+}
+
+func (r activityRecord) deniedEnum() bool {
+	return r.ActionID == deniedID || r.DispositionID == deniedID
 }
 
 func activityUnmapped(raw json.RawMessage) (map[string]json.RawMessage, bool) {
@@ -84,92 +136,123 @@ func activityUnmapped(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	return fields, true
 }
 
-func classifyActivityDiagnostic(ev Event, unmapped map[string]json.RawMessage) (classifiedActivity, bool) {
-	switch ev.StatusDetail {
+func classifyCoverageMetadata(record activityRecord) (classifiedActivity, bool) {
+	raw, present := record.unmapped["coverage_state"]
+	if !present {
+		return classifiedActivity{}, false
+	}
+	var state string
+	if json.Unmarshal(raw, &state) != nil || state == "" {
+		return classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}, true
+	}
+	return classifiedActivity{Diagnostic: "coverage"}, true
+}
+
+func classifyStatusDetail(record activityRecord) (classifiedActivity, bool) {
+	switch record.StatusDetail {
 	case "credential_endpoint_mismatch", "request_authority_mismatch":
 		return classifiedActivity{Diagnostic: "unclassified_guard_denial", Incomplete: true}, true
 	case "credential_unavailable", "assembly_capacity_exhausted", "policy_dns_trusted_gateway_unavailable":
 		return classifiedActivity{Diagnostic: "operational_failure"}, true
-	}
-	if result, ok := classifyMiddlewareActivity(ev, unmapped); ok {
-		return result, true
-	}
-	if ev.ClassUID == ClassHTTPActivity && strings.HasPrefix(ev.Message, "HTTP_REQUEST ") {
-		if ev.ActionID == deniedID || ev.DispositionID == deniedID {
-			return unknownActivity(groupHTTPInitial), true
-		}
-		return classifiedActivity{Diagnostic: "passthrough_http"}, true
-	}
-	if ev.ClassUID != ClassNetworkActivity {
+	default:
 		return classifiedActivity{}, false
 	}
-	return classifyNetworkDiagnostic(ev)
 }
 
-func classifyNetworkDiagnostic(ev Event) (classifiedActivity, bool) {
-	if strings.HasPrefix(ev.Message, "WEBSOCKET_MIDDLEWARE_COVERAGE ") {
-		return classifiedActivity{Diagnostic: "coverage"}, true
-	}
-	if strings.HasPrefix(ev.Message, "WEBSOCKET_CREDENTIAL_REWRITE ") {
-		return classifiedActivity{Diagnostic: "operational_failure"}, true
-	}
-	if ev.ActivityID == networkActivityOpen && ev.ActionID == 0 && ev.DispositionID == 0 {
-		message := strings.ToLower(ev.Message)
-		if message == "supervisor session established" || strings.HasPrefix(message, "supervisor session established (") {
-			return classifiedActivity{Diagnostic: "session"}, true
-		}
-	}
-	if ev.ActivityID == networkActivityFail && ev.ActionID == 0 && ev.DispositionID == 0 {
-		return classifiedActivity{Diagnostic: "connection_failure"}, true
-	}
-	if ev.ActivityID == networkActivityTraffic {
-		if ev.StatusDetail == "policy_dns_ineligible" && strings.HasPrefix(ev.Message, "Policy DNS refused ") &&
-			(ev.ActionID == deniedID || ev.DispositionID == deniedID) && decisionEnumsMatch(ev, decisionDenied) {
-			return classifiedActivity{Diagnostic: "dns_refused"}, true
-		}
-		return classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}, true
-	}
-	return classifiedActivity{}, false
-}
-
-func classifyMiddlewareActivity(ev Event, unmapped map[string]json.RawMessage) (classifiedActivity, bool) {
-	if ev.ClassUID == ClassHTTPActivity && strings.HasPrefix(ev.Message, "MIDDLEWARE ") {
-		failed, valid := activityFailed(unmapped)
-		if !valid {
-			return classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}, true
-		}
-		if failed {
-			return classifiedActivity{Diagnostic: "middleware_failure"}, true
-		}
-		decision := activityMessageValue(ev.Message, "decision")
-		if decision != "Allow" && decision != "Deny" {
-			return classifiedActivity{Diagnostic: "unknown_middleware_decision", Incomplete: true}, true
-		}
-		if decision == "Deny" || ev.ActionID == deniedID || ev.DispositionID == deniedID {
-			return classifiedActivity{Diagnostic: "unclassified_middleware_denial", Incomplete: true}, true
-		}
-		return classifiedActivity{Diagnostic: "middleware_stage"}, true
-	}
-	if ev.ClassUID != ClassNetworkActivity || !strings.HasPrefix(ev.Message, "WEBSOCKET_MIDDLEWARE ") {
+func classifyHTTPMiddleware(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassHTTPActivity || !strings.HasPrefix(record.Message, "MIDDLEWARE ") {
 		return classifiedActivity{}, false
 	}
-	parts := strings.Fields(ev.Message)
-	if len(parts) < middlewareTokenCount {
+	failed, valid := activityFailed(record.unmapped)
+	if !valid {
+		return classifiedActivity{Diagnostic: "invalid_metadata", Incomplete: true}, true
+	}
+	if failed {
+		return classifiedActivity{Diagnostic: "middleware_failure"}, true
+	}
+	decision := activityMessageValue(record.Message, "decision")
+	if decision != "Allow" && decision != "Deny" {
 		return classifiedActivity{Diagnostic: "unknown_middleware_decision", Incomplete: true}, true
 	}
-	switch parts[1] {
+	if decision == "Deny" || record.deniedEnum() {
+		return classifiedActivity{Diagnostic: "unclassified_middleware_denial", Incomplete: true}, true
+	}
+	return classifiedActivity{Diagnostic: "middleware_stage"}, true
+}
+
+func classifyWebSocketMiddleware(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity || !strings.HasPrefix(record.Message, "WEBSOCKET_MIDDLEWARE ") {
+		return classifiedActivity{}, false
+	}
+	if len(record.tokens) < middlewareTokenCount {
+		return classifiedActivity{Diagnostic: "unknown_middleware_decision", Incomplete: true}, true
+	}
+	switch record.tokens[1] {
 	case "fail_open", "fail_closed":
 		return classifiedActivity{Diagnostic: "middleware_failure"}, true
 	case "deny":
 		return classifiedActivity{Diagnostic: "unclassified_middleware_denial", Incomplete: true}, true
 	case "inspect", "voluntary_skip", "allow":
-		if ev.ActionID == deniedID || ev.DispositionID == deniedID {
+		if record.deniedEnum() {
 			return classifiedActivity{Diagnostic: "unclassified_middleware_denial", Incomplete: true}, true
 		}
 		return classifiedActivity{Diagnostic: "middleware_stage"}, true
 	default:
 		return classifiedActivity{Diagnostic: "unknown_middleware_decision", Incomplete: true}, true
 	}
+}
+
+func classifyPassthroughHTTP(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassHTTPActivity || !strings.HasPrefix(record.Message, "HTTP_REQUEST ") {
+		return classifiedActivity{}, false
+	}
+	if record.deniedEnum() {
+		return unknownActivity(groupHTTPInitial), true
+	}
+	return classifiedActivity{Diagnostic: "passthrough_http"}, true
+}
+
+func classifyWebSocketNotice(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity {
+		return classifiedActivity{}, false
+	}
+	switch {
+	case strings.HasPrefix(record.Message, "WEBSOCKET_MIDDLEWARE_COVERAGE "):
+		return classifiedActivity{Diagnostic: "coverage"}, true
+	case strings.HasPrefix(record.Message, "WEBSOCKET_CREDENTIAL_REWRITE "):
+		return classifiedActivity{Diagnostic: "operational_failure"}, true
+	default:
+		return classifiedActivity{}, false
+	}
+}
+
+func classifySession(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity || record.ActivityID != networkActivityOpen || !record.withoutDecisionEnums() {
+		return classifiedActivity{}, false
+	}
+	message := strings.ToLower(record.Message)
+	if message == "supervisor session established" || strings.HasPrefix(message, "supervisor session established (") {
+		return classifiedActivity{Diagnostic: "session"}, true
+	}
+	return classifiedActivity{}, false
+}
+
+func classifyConnectionFailure(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity || record.ActivityID != networkActivityFail || !record.withoutDecisionEnums() {
+		return classifiedActivity{}, false
+	}
+	return classifiedActivity{Diagnostic: "connection_failure"}, true
+}
+
+func classifyDNSTraffic(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity || record.ActivityID != networkActivityTraffic {
+		return classifiedActivity{}, false
+	}
+	if record.StatusDetail == "policy_dns_ineligible" && strings.HasPrefix(record.Message, "Policy DNS refused ") &&
+		record.deniedEnum() && decisionEnumsMatch(record.Event, decisionDenied) {
+		return classifiedActivity{Diagnostic: activityDNSRefused}, true
+	}
+	return classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}, true
 }
 
 func activityFailed(unmapped map[string]json.RawMessage) (bool, bool) {
@@ -197,27 +280,40 @@ func activityMessageValue(message, key string) string {
 	return value
 }
 
-func classifyL7Activity(ev Event) (classifiedActivity, bool) {
-	parts := strings.Fields(ev.Message)
-	if len(parts) == 0 {
-		return classifiedActivity{}, false
+// l7DecisionGroup reports the measurement group of a known L7 policy-decision
+// message, judged by its first token only.
+func l7DecisionGroup(tokens []string) (activityGroup, bool) {
+	if len(tokens) == 0 {
+		return "", false
 	}
-	group, class := groupHTTPInitial, ClassHTTPActivity
-	switch parts[0] {
+	switch tokens[0] {
 	case "L7_REQUEST", "GRAPHQL_L7_REQUEST", "JSONRPC_L7_REQUEST":
+		return groupHTTPInitial, true
 	case "L7_REQUEST_TRANSFORMED":
-		group = groupPostRewrite
+		return groupPostRewrite, true
 	case "WEBSOCKET_L7_REQUEST":
-		group, class = groupWebSocket, ClassNetworkActivity
+		return groupWebSocket, true
 	default:
+		return "", false
+	}
+}
+
+func classifyL7Decision(record activityRecord) (classifiedActivity, bool) {
+	group, ok := l7DecisionGroup(record.tokens)
+	if !ok {
 		return classifiedActivity{}, false
 	}
-	if ev.ClassUID != class || ev.ActivityID != policyActivityOther || len(parts) < minimumJSONRPCTokens {
+	class := ClassHTTPActivity
+	if group == groupWebSocket {
+		class = ClassNetworkActivity
+	}
+	parts := record.tokens
+	if record.ClassUID != class || record.ActivityID != policyActivityOther || len(parts) < minimumJSONRPCTokens {
 		return unknownActivity(group), true
 	}
 	token := parts[1]
 	if parts[0] == "JSONRPC_L7_REQUEST" {
-		if !strings.HasPrefix(token, "decision=") || activityMessageValue(ev.Message, "http_method") == "" || activityMessageValue(ev.Message, "endpoint") == "" {
+		if !strings.HasPrefix(token, "decision=") || activityMessageValue(record.Message, "http_method") == "" || activityMessageValue(record.Message, "endpoint") == "" {
 			return unknownActivity(group), true
 		}
 		token = strings.TrimPrefix(token, "decision=")
@@ -225,7 +321,7 @@ func classifyL7Activity(ev Event) (classifiedActivity, bool) {
 		return unknownActivity(group), true
 	}
 	decision := activityDecision(token)
-	if decision == decisionUnknown || !decisionEnumsMatch(ev, decision) {
+	if decision == decisionUnknown || !decisionEnumsMatch(record.Event, decision) {
 		return unknownActivity(group), true
 	}
 	return classifiedActivity{Group: group, Decision: decision, AuditFallback: decision == decisionAudited}, true
@@ -255,23 +351,25 @@ func decisionEnumsMatch(ev Event, decision policyDecision) bool {
 	return (ev.ActionID == 0 || ev.ActionID == id) && (ev.DispositionID == 0 || ev.DispositionID == id)
 }
 
-func classifyConnectionActivity(ev Event) classifiedActivity {
-	if ev.ClassUID == ClassHTTPActivity {
+// classifyConnectionActivity is the last rule: it counts connection decisions
+// and gives every other record a class-based fallback.
+func classifyConnectionActivity(record activityRecord) classifiedActivity {
+	if record.ClassUID == ClassHTTPActivity {
 		return unknownActivity(groupHTTPInitial)
 	}
-	if ev.ClassUID != ClassNetworkActivity {
+	if record.ClassUID != ClassNetworkActivity {
 		return classifiedActivity{Diagnostic: "other"}
 	}
-	if ev.ActivityID == policyActivityOther {
+	if record.ActivityID == policyActivityOther {
 		return unknownActivity(groupWebSocket)
 	}
-	if ev.ActivityID != networkActivityOpen {
-		if ev.ActionID == 0 && ev.DispositionID == 0 {
+	if record.ActivityID != networkActivityOpen {
+		if record.withoutDecisionEnums() {
 			return classifiedActivity{Diagnostic: "network_no_policy_decision"}
 		}
 		return unknownActivity(groupConnections)
 	}
-	parts := strings.Fields(ev.Message)
+	parts := record.tokens
 	decision := decisionUnknown
 	if len(parts) >= minimumJSONRPCTokens && (parts[0] == "CONNECT" || parts[0] == "CONNECT_L7") {
 		switch parts[1] {
@@ -280,13 +378,13 @@ func classifyConnectionActivity(ev Event) classifiedActivity {
 		case "denied":
 			decision = decisionDenied
 		}
-	} else if strings.HasPrefix(ev.Message, "Transparent TCP ") {
-		decision = transparentPolicyDecision(ev)
+	} else if strings.HasPrefix(record.Message, "Transparent TCP ") {
+		decision = transparentPolicyDecision(record.Event)
 	}
-	if decision != decisionUnknown && decisionEnumsMatch(ev, decision) {
+	if decision != decisionUnknown && decisionEnumsMatch(record.Event, decision) {
 		return classifiedActivity{Group: groupConnections, Decision: decision}
 	}
-	if ev.ActionID == 0 && ev.DispositionID == 0 && !strings.HasPrefix(ev.Message, "CONNECT") && !strings.HasPrefix(ev.Message, "Transparent TCP ") {
+	if record.withoutDecisionEnums() && !strings.HasPrefix(record.Message, "CONNECT") && !strings.HasPrefix(record.Message, "Transparent TCP ") {
 		return classifiedActivity{Diagnostic: "network_no_policy_decision"}
 	}
 	return unknownActivity(groupConnections)

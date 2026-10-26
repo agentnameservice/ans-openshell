@@ -92,7 +92,8 @@ func (s *agentStats) rate() float64 {
 
 // aggregator attributes events to agents and tracks the input window.
 type aggregator struct {
-	activity        *activityAggregator
+	// skipLegacyStats counts attributed events without accumulating the legacy
+	// observation payload, when no legacy signal will be emitted.
 	skipLegacyStats bool
 	agents          AgentMap
 	window          *Window
@@ -110,9 +111,6 @@ func newAggregator(agents AgentMap, window *Window) *aggregator {
 }
 
 func (a *aggregator) add(ev Event) {
-	if a.activity != nil {
-		a.activity.add(ev)
-	}
 	ts, hasTime := ev.Timestamp()
 	if a.window != nil {
 		if !hasTime || !a.window.Contains(ts) {

@@ -368,11 +368,12 @@ func logActivity(ctx context.Context, logger *slog.Logger, evidence []hydrator.A
 		if item.Score != nil {
 			score = *item.Score
 		}
-		level := slog.LevelWarn
-		if item.Unavailable == "" || item.Unavailable == "no_eligible_decisions" || item.Unavailable == "insufficient_sample" {
-			level = slog.LevelInfo
+		level := slog.LevelInfo
+		if item.Degraded() {
+			level = slog.LevelWarn
 		}
 		logger.Log(ctx, level, "activity summary", "agent_id", item.AgentID,
-			"score", score, "sample_size", item.SampleSize, "unavailable_reason", item.Unavailable)
+			"score", score, "sample_size", item.SampleSize, "denied", item.Measurements.Denied(),
+			"unavailable_reason", item.Unavailable)
 	}
 }

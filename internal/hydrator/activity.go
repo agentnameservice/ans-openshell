@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -99,7 +100,15 @@ func (a *activityAggregator) acceptUID(st *activityStats, uid string) bool {
 		st.diagnostics["duplicate_events"]++
 		return false
 	}
-	if len(uid) > maxActivityText || len(st.seen) >= a.config.MaxUIDsPerAgent {
+	if len(uid) > maxActivityText {
+		// An unbounded UID cannot be deduplicated within the memory budget.
+		st.diagnostics["oversized_event_uid"]++
+		if st.unavailable == "" {
+			st.unavailable = activityIncomplete
+		}
+		return false
+	}
+	if len(st.seen) >= a.config.MaxUIDsPerAgent {
 		a.saturate(st)
 		return false
 	}
@@ -185,8 +194,8 @@ func (s *activityStats) observe(ev Event) {
 		s.addDecision(route.Group, route.Decision)
 		s.recordDecisionTime(ev)
 	}
-	if route.Diagnostic == "dns_refused" || route.Group == groupConnections && route.Decision == decisionDenied {
-		s.recordDenialCoverage(ev, route.Diagnostic == "dns_refused")
+	if route.Diagnostic == activityDNSRefused || route.Group == groupConnections && route.Decision == decisionDenied {
+		s.recordDenialCoverage(ev, route.Diagnostic == activityDNSRefused)
 	}
 }
 
@@ -321,7 +330,9 @@ func (s *activityStats) addPolicy(ev Event, window *Window) {
 	}
 }
 
-func (a *activityAggregator) evidence(window Window, unreadable int) []ActivityEvidence {
+// evidence summarizes every active agent. It does not modify the aggregator,
+// so repeated calls return the same result.
+func (a *activityAggregator) evidence(window Window, input auditInputHealth) []ActivityEvidence {
 	ids := make([]string, 0, len(a.stats))
 	for id, st := range a.stats {
 		if st.active {
@@ -331,26 +342,38 @@ func (a *activityAggregator) evidence(window Window, unreadable int) []ActivityE
 	slices.Sort(ids)
 	out := make([]ActivityEvidence, 0, len(ids))
 	for _, id := range ids {
-		st := a.stats[id]
-		if unreadable > 0 {
-			st.unavailable = "unreadable_audit_records"
-			st.diagnostics["unreadable_audit_records"] = unreadable
-		}
-		out = append(out, st.evidence(id, window, a.config.MinDecisions))
+		out = append(out, a.stats[id].evidence(id, window, a.config.MinDecisions, input))
 	}
 	return out
 }
 
-func (s *activityStats) evidence(id string, window Window, minimum int) ActivityEvidence {
+// finalState returns the unavailable reason and diagnostics after the
+// end-of-input checks, without changing the accumulated state. The first
+// recorded reason wins, so a later check never hides an earlier one.
+func (s *activityStats) finalState(input auditInputHealth) (string, map[string]int) {
+	unavailable := s.unavailable
+	diagnostics := maps.Clone(s.diagnostics)
 	for key, counts := range s.denialCoverage {
 		// This is only an aggregate coverage guard, never event pairing or unique-request reconstruction.
 		if counts.dns > counts.tcp || counts.dns > 0 && key.destination == "" {
-			if s.unavailable == "" {
-				s.unavailable = activityIncomplete
-			}
-			s.diagnostics["unrepresented_dns_refusals"] += counts.dns
+			unavailable = cmp.Or(unavailable, activityIncomplete)
+			diagnostics["unrepresented_dns_refusals"] += counts.dns
 		}
 	}
+	// An unreadable audit line cannot be attributed to an agent, so it withholds every new score.
+	if input.unreadable > 0 {
+		unavailable = cmp.Or(unavailable, activityUnreadableRecords)
+		diagnostics[activityUnreadableRecords] = input.unreadable
+	}
+	// A final line without a newline is still being written; the next run reads it whole.
+	if input.truncatedTail > 0 {
+		diagnostics["truncated_final_line"] = input.truncatedTail
+	}
+	return unavailable, diagnostics
+}
+
+func (s *activityStats) evidence(id string, window Window, minimum int, input auditInputHealth) ActivityEvidence {
+	unavailable, diagnostics := s.finalState(input)
 	policies := make([]PolicyContext, 0, len(s.policies))
 	for _, p := range s.policies {
 		policies = append(policies, p)
@@ -365,8 +388,23 @@ func (s *activityStats) evidence(id string, window Window, minimum int) Activity
 	slices.SortFunc(findings, func(a, b ActivityFinding) int {
 		return cmp.Or(cmp.Compare(a.Origin, b.Origin), cmp.Compare(a.Middleware, b.Middleware), cmp.Compare(a.Type, b.Type), cmp.Compare(a.Severity, b.Severity))
 	})
-	score, reason, sample := assessActivity(s.measurements, minimum, s.unavailable)
-	ev := ActivityEvidence{SchemaVersion: 1, AgentID: id, WindowStart: formatTime(window.Start), WindowEnd: formatTime(window.End), Measurements: s.measurements, ReportedStatus: s.reportedStatus, SourceVersions: s.versions, Findings: findings, Diagnostics: s.diagnostics, Policies: policies, PolicyUnknown: !s.hasPolicyContext(policies), SampleSize: sample, Score: score, Unavailable: reason}
+	score, reason, sample := assessActivity(s.measurements, minimum, unavailable)
+	ev := ActivityEvidence{
+		SchemaVersion:  1,
+		AgentID:        id,
+		WindowStart:    formatTime(window.Start),
+		WindowEnd:      formatTime(window.End),
+		Measurements:   s.measurements,
+		ReportedStatus: maps.Clone(s.reportedStatus),
+		SourceVersions: maps.Clone(s.versions),
+		Findings:       findings,
+		Diagnostics:    diagnostics,
+		Policies:       policies,
+		PolicyUnknown:  !s.hasPolicyContext(policies),
+		SampleSize:     sample,
+		Score:          score,
+		Unavailable:    reason,
+	}
 	if !s.first.IsZero() {
 		ev.FirstEventAt = formatTime(s.first)
 		ev.LastEventAt = formatTime(s.last)
@@ -426,8 +464,10 @@ func activityExplanation(ev ActivityEvidence) string {
 	}
 	// Bound the explanation; full finding details remain in the separate structured output.
 	const summaryLimit = 8
+	// Middleware and type come from audit records; quoting keeps them from reading as explanation text.
 	for _, f := range ev.Findings[:min(len(ev.Findings), summaryLimit)] {
-		fmt.Fprintf(&out, " Finding source=%s/%s type=%s severity=%d records=%d matches=%d; evidence only.", f.Origin, boundedActivityText(f.Middleware), boundedActivityText(f.Type), f.Severity, f.Records, f.Occurrences)
+		fmt.Fprintf(&out, " Finding origin=%s middleware=%q type=%q severity=%d records=%d matches=%d; evidence only.",
+			f.Origin, boundedActivityText(f.Middleware), boundedActivityText(f.Type), f.Severity, f.Records, f.Occurrences)
 	}
 	if len(ev.Findings) > summaryLimit {
 		fmt.Fprintf(&out, " %d additional finding groups in local evidence.", len(ev.Findings)-summaryLimit)

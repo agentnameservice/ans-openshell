@@ -82,7 +82,11 @@ local output without inventing a numeric score.
 
 Unknown policy syntax, incomplete interpretation, and exhausted deduplication
 budgets suppress the affected agent's new score and record the reason. Other
-agents continue. Bound and size `activity.max_uids_per_agent` and
+agents continue. A record whose message states a policy decision but that is
+not counted as one (for example because it also carries a coverage or
+operational-failure status) also counts as incomplete, so a conflicting record
+cannot hide a denial. The first recorded reason is kept; later problems appear
+only as diagnostics. Bound and size `activity.max_uids_per_agent` and
 `activity.max_uids` for the deployment's volume; their defaults are 100,000 and
 1,000,000 respectively. Duplicate event IDs are removed only from the new path,
 leaving legacy behavior unchanged.
@@ -91,6 +95,21 @@ When the aggregate UID budget fills, the hydrator marks the largest existing
 UID owner unavailable and releases its set; ties use agent ID order. This lets
 later agents proceed within the same memory budget. A budget too small for the
 whole deployment can still make several agents unavailable.
+
+An audit-shaped line that cannot be decoded or exceeds 1 MiB (a JSON object,
+or a stderr line whose `OCSF-JSON ` marker is followed by an object or by
+nothing) cannot be attributed to a sandbox, so it withholds every agent's score
+with `unreadable_audit_records`. Ordinary log lines that merely mention the
+marker do not. Such a line has no readable timestamp, so the window cannot
+exclude it: it withholds scores on every run until the input file rotates. Keep
+the input to OpenShell audit records only; JSON logs from other programs whose
+fields do not match the OCSF types count as unreadable.
+
+A final line without a trailing newline is treated as a record still being
+written: it is counted as `truncated_final_line` and does not withhold scores.
+The next run counts it only if its timestamp falls inside that run's window, so
+set the window longer than the schedule interval (for example `window: 1h` with
+a 15-minute schedule).
 
 DNS refusals are retained separately from TCP policy checks. The hydrator checks
 that denied TCP counts cover the DNS refusals for each sandbox and destination;
@@ -110,10 +129,28 @@ with `--dry-run`, which reserves stdout for the import request. With all three
 signal IDs set to `""`, evidence output works without a Trust Index URL or server.
 
 For scheduled Helm jobs, use `hydrator.evidenceOutput: "-"` so the log collector
-retains each run's evidence. A fixed filename on a persistent volume works only
-once: later jobs fail because evidence files are create-only. File output needs
-a different filename for every run, supplied outside this chart.
+retains each run's evidence. The chart refuses to render any other value: a fixed
+filename would make every run after the first fail before posting, including the
+legacy outputs, because evidence files are create-only.
 
 The existing `provenance.evidence_url` is one static URL reused for every
 observation. It does not create immutable evidence storage for each agent/window;
 the example leaves it unset.
+
+## Known limits before raising the weight
+
+- A sandbox writes its own audit records, so an agent that can emit an
+  unrecognized or conflicting decision record can withhold its own new score.
+  Together with the consumer retaining the last score, a previously clean agent
+  can keep 100 after later violations. This is one more reason the weight stays
+  at 0 until scores expire.
+- If a sandbox can cause one unreadable or oversized audit line in the shared
+  input (for example through an unbounded request field), it withholds every
+  agent's new score, not only its own, until the file rotates. All agents then
+  keep their previous scores in the reference implementation.
+- The score is rounded, so a single violation among 200 or more decisions still
+  reports 100. The evidence output keeps the exact counts.
+- Rollout behavior (weight 0 has no effect on trust decisions, retained scores,
+  whole-batch rejection) belongs to the consumer and is not tested in this
+  repository. Verify it against the deployed `agent-trust-discovery` before
+  changing the weight.

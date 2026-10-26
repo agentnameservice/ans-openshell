@@ -43,9 +43,11 @@ type Options struct {
 
 // AgentSummary reports one agent's share of the input.
 type AgentSummary struct {
-	AgentID      string
-	AnsName      string
-	Events       int
+	AgentID string
+	AnsName string
+	Events  int
+	// Denied counts events under the legacy rule. It stays zero when only the
+	// activity output is enabled; Report.Activity carries corrected counts.
 	Denied       int
 	Observations int
 }
@@ -89,12 +91,8 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 		clock = time.Now
 	}
 	reader := NewReader(in)
-	agg := newAggregator(opts.Agents, opts.Window)
-	if opts.Signals.EmitActivity || opts.Evidence != nil {
-		agg.activity = newActivityAggregator(opts.Agents, opts.Window, opts.Activity)
-		agg.skipLegacyStats = !opts.Signals.EmitPolicyViolationRate && !opts.Signals.EmitProtocolAdherence
-	}
-	err := consume(ctx, reader, agg)
+	agg, activity := newAggregators(opts)
+	err := consume(ctx, reader, eventConsumers(agg, activity)...)
 	report := Report{
 		Parse:       reader.Stats(),
 		Attributed:  agg.attributed,
@@ -106,15 +104,10 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	if err != nil {
 		return report, err
 	}
-	if agg.activity != nil {
-		report.Activity = agg.activity.evidence(report.Window, reader.invalidOCSF+reader.oversizedOCSF)
-		if opts.Evidence != nil {
-			encoder := json.NewEncoder(opts.Evidence)
-			for _, evidence := range report.Activity {
-				if err := encoder.Encode(evidence); err != nil {
-					return report, fmt.Errorf("hydrator: write activity evidence: %w", err)
-				}
-			}
+	if activity != nil {
+		report.Activity = activity.evidence(report.Window, reader.auditHealth())
+		if err := writeActivityEvidence(opts.Evidence, report.Activity); err != nil {
+			return report, err
 		}
 	}
 	logger.DebugContext(ctx, "input parsed",
@@ -150,7 +143,44 @@ func Run(ctx context.Context, in io.Reader, sink Sink, opts Options, logger *slo
 	return report, nil
 }
 
-func consume(ctx context.Context, reader *Reader, agg *aggregator) error {
+// eventConsumer receives every decoded event in input order.
+type eventConsumer interface {
+	add(ev Event)
+}
+
+// newAggregators returns the legacy aggregator, which also drives attribution
+// and the report window, and the activity aggregator when corrected evidence
+// or scores are requested (nil otherwise).
+func newAggregators(opts Options) (*aggregator, *activityAggregator) {
+	agg := newAggregator(opts.Agents, opts.Window)
+	if !opts.Signals.EmitActivity && opts.Evidence == nil {
+		return agg, nil
+	}
+	agg.skipLegacyStats = !opts.Signals.EmitPolicyViolationRate && !opts.Signals.EmitProtocolAdherence
+	return agg, newActivityAggregator(opts.Agents, opts.Window, opts.Activity)
+}
+
+func eventConsumers(agg *aggregator, activity *activityAggregator) []eventConsumer {
+	if activity == nil {
+		return []eventConsumer{agg}
+	}
+	return []eventConsumer{agg, activity}
+}
+
+func writeActivityEvidence(writer io.Writer, evidence []ActivityEvidence) error {
+	if writer == nil {
+		return nil
+	}
+	encoder := json.NewEncoder(writer)
+	for _, item := range evidence {
+		if err := encoder.Encode(item); err != nil {
+			return fmt.Errorf("hydrator: write activity evidence: %w", err)
+		}
+	}
+	return nil
+}
+
+func consume(ctx context.Context, reader *Reader, consumers ...eventConsumer) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("hydrator: %w", err)
@@ -162,7 +192,9 @@ func consume(ctx context.Context, reader *Reader, agg *aggregator) error {
 		if err != nil {
 			return err
 		}
-		agg.add(ev)
+		for _, consumer := range consumers {
+			consumer.add(ev)
+		}
 	}
 }
 
@@ -186,28 +218,18 @@ func buildObservations(agg *aggregator, window Window, opts Options, report *Rep
 			return nil, err
 		}
 		if evidence, ok := activity[id]; ok && builder.signals.EmitActivity && evidence.Score != nil {
-			value := struct {
-				Score       int    `json:"score"`
-				Explanation string `json:"explanation"`
-			}{Score: *evidence.Score, Explanation: activityExplanation(evidence)}
-			row, err := builder.observation(id, builder.signals.ActivityID, value)
+			row, err := builder.activity(id, evidence)
 			if err != nil {
 				return nil, err
 			}
 			obs = append(obs, row)
 		}
 		observations = append(observations, obs...)
-		denied := st.denied
-		if agg.skipLegacyStats {
-			for _, counts := range activity[id].Measurements.groups() {
-				denied += counts.Denied
-			}
-		}
 		report.Agents = append(report.Agents, AgentSummary{
 			AgentID:      id,
 			AnsName:      st.mapping.AnsName,
 			Events:       st.events,
-			Denied:       denied,
+			Denied:       st.denied,
 			Observations: len(obs),
 		})
 	}

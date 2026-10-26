@@ -87,7 +87,7 @@ hydrator:
   schedule: "*/15 * * * *"
   window: 15m          # --window-last; empty aggregates the whole input every run
   input: /var/log/openshell/supervisor-ocsf.jsonl
-  evidenceOutput: ""   # optional corrected JSONL evidence; use "-" for stdout, or a new file on a writable volume
+  evidenceOutput: ""   # "-" writes corrected JSONL evidence to stdout; file paths are rejected because each scheduled run would collide with the last
   nodeSelector: {}
   adminKeySecret: ""   # secret with key ANS_TRUST_INDEX_ADMIN_KEY; empty posts without Authorization
   extraVolumes: []

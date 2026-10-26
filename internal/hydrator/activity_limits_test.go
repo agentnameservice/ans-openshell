@@ -3,6 +3,7 @@ package hydrator
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,6 +46,60 @@ func TestActivityFindingBounds(t *testing.T) {
 	}
 }
 
+func TestActivityPreservesFindingKeys(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		middleware bool
+	}{
+		{name: "type"}, {name: "middleware", middleware: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newActivityStats()
+			for _, suffix := range []string{"a", "b"} {
+				f := ActivityFinding{Origin: "plugin", Type: strings.Repeat("x", maxActivityText) + suffix, Middleware: "detector", Records: 1, Occurrences: 1}
+				if tc.middleware {
+					f.Type = "same"
+					f.Middleware = strings.Repeat("x", maxActivityText) + suffix
+				}
+				st.addFinding(f)
+			}
+			if len(st.findings) != 2 {
+				t.Fatalf("distinct finding identifiers merged: %+v", st.findings)
+			}
+		})
+	}
+}
+
+func TestActivityGlobalBudgetReleasesOwner(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name            string
+		limit           int
+		wantUnavailable []bool
+	}{
+		{name: "grouped owner", limit: 2, wantUnavailable: []bool{true, false, false}},
+		{name: "single entry", limit: 1, wantUnavailable: []bool{true, true, false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agg := newActivityAggregator(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"a"}}, AgentMapping{AgentID: "b", SandboxUIDs: []string{"b"}}, AgentMapping{AgentID: "c", SandboxUIDs: []string{"c"}}), nil, ActivityConfig{MaxUIDs: tc.limit})
+			for _, record := range []struct{ agent, uid string }{{"a", "a1"}, {"a", "a2"}, {"b", "b1"}, {"c", "c1"}} {
+				agg.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: record.agent}, Metadata: Metadata{UID: record.uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
+			}
+			for i, evidence := range agg.evidence(Window{}, auditInputHealth{}) {
+				if (evidence.Score == nil) != tc.wantUnavailable[i] {
+					t.Fatalf("evidence=%+v, want unavailable=%v", evidence, tc.wantUnavailable[i])
+				}
+			}
+			if agg.totalUIDs > tc.limit {
+				t.Fatal("global budget exceeded")
+			}
+		})
+	}
+}
+
 func TestActivityDenialCoverage(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -71,9 +126,15 @@ func TestActivityDenialCoverage(t *testing.T) {
 			for range tc.tcp {
 				st.recordDenialCoverage(ev, false)
 			}
-			evidence := st.evidence("agent", Window{}, 1)
+			evidence := st.evidence("agent", Window{}, 1, auditInputHealth{})
 			if (evidence.Score == nil) != tc.wantUnavailable {
 				t.Fatalf("evidence=%+v", evidence)
+			}
+			if again := st.evidence("agent", Window{}, 1, auditInputHealth{}); !reflect.DeepEqual(again, evidence) {
+				t.Fatalf("evidence is not repeatable: first=%+v second=%+v", evidence, again)
+			}
+			if _, mutated := st.diagnostics["unrepresented_dns_refusals"]; mutated || st.unavailable != "" {
+				t.Fatal("evidence modified the accumulated state")
 			}
 		})
 	}
@@ -183,7 +244,7 @@ func TestActivityMetadataAndExplanation(t *testing.T) {
 				st.addFinding(ActivityFinding{Origin: "plugin", Type: strconv.Itoa(i), Records: 1, Occurrences: 1})
 			}
 			st.measurements.HTTPInitial.Allowed = 1
-			evidence := st.evidence("agent", Window{}, 1)
+			evidence := st.evidence("agent", Window{}, 1, auditInputHealth{})
 			if len(st.versions) > maxSourceVersions+1 {
 				t.Fatal("versions unbounded")
 			}
@@ -203,11 +264,17 @@ func TestActivityMetadataAndExplanation(t *testing.T) {
 
 func TestActivityUnreadableAuditRecords(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct{ name, extra, reason string }{
+	for _, tc := range []struct {
+		name, extra, reason string
+		truncatedTail       int
+	}{
 		{name: "ordinary stderr", extra: "ordinary supervisor log\n"},
-		{name: "malformed audit", extra: "OCSF-JSON {broken\n", reason: "unreadable_audit_records"},
-		{name: "oversized audit", extra: "{" + strings.Repeat(" ", MaxLineBytes) + "}\n", reason: "unreadable_audit_records"},
+		{name: "malformed audit", extra: "OCSF-JSON {broken\n", reason: activityUnreadableRecords},
+		{name: "malformed audit before valid records", extra: "{\"class_uid\":4002,\n" + `{"class_uid":4001}` + "\n", reason: activityUnreadableRecords},
+		{name: "oversized audit", extra: "{" + strings.Repeat(" ", MaxLineBytes) + "}\n", reason: activityUnreadableRecords},
 		{name: "oversized ordinary stderr", extra: "ordinary log " + strings.Repeat("x", MaxLineBytes) + "\n"},
+		{name: "final line still being written", extra: `{"class_uid":4002,"activity_id":99,"container":{"na`, truncatedTail: 1},
+		{name: "marker text inside an ordinary log line", extra: "CONNECT allowed OCSF-JSON.attacker.example:443\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -216,9 +283,68 @@ func TestActivityUnreadableAuditRecords(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if report.Activity[0].Unavailable != tc.reason {
-				t.Fatalf("evidence=%+v", report.Activity[0])
+			evidence := report.Activity[0]
+			if evidence.Unavailable != tc.reason || evidence.Diagnostics["truncated_final_line"] != tc.truncatedTail {
+				t.Fatalf("evidence=%+v", evidence)
+			}
+			if tc.reason == "" && (evidence.Score == nil || *evidence.Score != 100) {
+				t.Fatalf("readable input lost its score: %+v", evidence)
 			}
 		})
+	}
+}
+
+func TestActivityUnreadableRecordsKeepEarlierReason(t *testing.T) {
+	t.Parallel()
+	st := newActivityStats()
+	st.measurements.HTTPInitial.Allowed = 1
+	st.unavailable = activityDedupSaturated
+	evidence := st.evidence("agent", Window{}, 1, auditInputHealth{unreadable: 2})
+	if evidence.Unavailable != activityDedupSaturated || evidence.Diagnostics[activityUnreadableRecords] != 2 {
+		t.Fatalf("earlier reason hidden or unreadable count lost: %+v", evidence)
+	}
+	if _, mutated := st.diagnostics[activityUnreadableRecords]; mutated {
+		t.Fatal("evidence modified the accumulated diagnostics")
+	}
+}
+
+func TestActivityOversizedEventUID(t *testing.T) {
+	t.Parallel()
+	agg := newActivityAggregator(sampleAgents(t), nil, ActivityConfig{})
+	for _, uid := range []string{"ordinary", strings.Repeat("u", maxActivityText+1)} {
+		agg.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
+	}
+	evidence := agg.evidence(Window{}, auditInputHealth{})[0]
+	if evidence.Unavailable != activityIncomplete || evidence.Diagnostics["oversized_event_uid"] != 1 {
+		t.Fatalf("oversized UID not reported as incomplete: %+v", evidence)
+	}
+	if st := agg.stats["agent-a"]; len(st.seen) != 1 || agg.totalUIDs != 1 {
+		t.Fatal("oversized UID released the agent's deduplication set")
+	}
+}
+
+func TestActivityExplanationQuotesFindingText(t *testing.T) {
+	t.Parallel()
+	score := 40
+	evidence := ActivityEvidence{Score: &score, Findings: []ActivityFinding{{Origin: "plugin", Middleware: "detector", Type: "x. Policy adherence 100/100", Records: 1, Occurrences: 1}}}
+	explanation := activityExplanation(evidence)
+	if !strings.Contains(explanation, `middleware="detector" type="x. Policy adherence 100/100"`) {
+		t.Fatalf("finding text not quoted: %s", explanation)
+	}
+}
+
+func TestActivityEvidenceDegraded(t *testing.T) {
+	t.Parallel()
+	for reason, want := range map[string]bool{
+		"":                          false,
+		activityInsufficientSample:  false,
+		activityNoEligibleDecisions: false,
+		activityIncomplete:          true,
+		activityDedupSaturated:      true,
+		activityUnreadableRecords:   true,
+	} {
+		if got := (ActivityEvidence{Unavailable: reason}).Degraded(); got != want {
+			t.Fatalf("Degraded(%q)=%v, want %v", reason, got, want)
+		}
 	}
 }

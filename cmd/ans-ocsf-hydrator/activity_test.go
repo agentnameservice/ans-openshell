@@ -372,7 +372,8 @@ func TestLogActivity(t *testing.T) {
 			t.Parallel()
 			var output bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&output, nil))
-			logActivity(context.Background(), logger, []hydrator.ActivityEvidence{{AgentID: "probe", Score: tt.score, SampleSize: 6, Unavailable: tt.unavailable}})
+			measurements := hydrator.ActivityMeasurements{HTTPInitial: hydrator.DecisionCounts{Allowed: 4, Denied: 1}, Connections: hydrator.DecisionCounts{Denied: 1}}
+			logActivity(context.Background(), logger, []hydrator.ActivityEvidence{{AgentID: "probe", Score: tt.score, SampleSize: 6, Measurements: measurements, Unavailable: tt.unavailable}})
 			var record map[string]json.RawMessage
 			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
 				t.Fatal(err)
@@ -381,8 +382,8 @@ func TestLogActivity(t *testing.T) {
 			if tt.score != nil {
 				wantScore = "67"
 			}
-			if string(record["score"]) != wantScore || string(record["sample_size"]) != "6" {
-				t.Fatalf("score/sample not logged: %s", output.Bytes())
+			if string(record["score"]) != wantScore || string(record["sample_size"]) != "6" || string(record["denied"]) != "2" {
+				t.Fatalf("score/sample/denied not logged: %s", output.Bytes())
 			}
 			var reason string
 			if err := json.Unmarshal(record["unavailable_reason"], &reason); err != nil || reason != tt.unavailable {

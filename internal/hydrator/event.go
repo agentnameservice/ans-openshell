@@ -155,11 +155,25 @@ type Reader struct {
 	// The corrected evidence path cannot safely attribute a discarded audit line.
 	invalidOCSF   int
 	oversizedOCSF int
+	truncatedTail int
+}
+
+// auditInputHealth counts audit lines the corrected evidence path could not use.
+type auditInputHealth struct {
+	// unreadable lines are malformed or oversized audit records in the body of the input.
+	unreadable int
+	// truncatedTail counts an undecodable final line without a newline, which
+	// a collector is usually still writing.
+	truncatedTail int
 }
 
 // NewReader returns a Reader over r.
 func NewReader(r io.Reader) *Reader {
 	return &Reader{br: bufio.NewReaderSize(r, readChunkBytes)}
+}
+
+func (r *Reader) auditHealth() auditInputHealth {
+	return auditInputHealth{unreadable: r.invalidOCSF + r.oversizedOCSF, truncatedTail: r.truncatedTail}
 }
 
 // Read returns the next event. It returns io.EOF once the input is exhausted
@@ -179,9 +193,7 @@ func (r *Reader) Read() (Event, error) {
 		}
 		ev, ok := decodeLine(line)
 		if !ok {
-			if looksLikeAudit(line) {
-				r.invalidOCSF++
-			}
+			r.countUndecodable(line)
 			r.stats.Skipped++
 			continue
 		}
@@ -207,7 +219,7 @@ func (r *Reader) readLine() ([]byte, bool, error) {
 		}
 		if !oversized {
 			if len(r.line)+len(chunk) > MaxLineBytes {
-				if looksLikeAudit(r.line) || looksLikeAudit(chunk) {
+				if looksLikeAudit(r.line) {
 					r.oversizedOCSF++
 				}
 				oversized = true
@@ -226,8 +238,32 @@ func (r *Reader) readLine() ([]byte, bool, error) {
 	}
 }
 
+// countUndecodable records an audit-looking line that did not decode. Only the
+// final line can lack its newline, since readLine splits on newlines.
+func (r *Reader) countUndecodable(line []byte) {
+	if !looksLikeAudit(line) {
+		return
+	}
+	if !bytes.HasSuffix(line, []byte("\n")) {
+		r.truncatedTail++
+		return
+	}
+	r.invalidOCSF++
+}
+
+// looksLikeAudit reports whether decodeLine would have tried to parse the line
+// as an audit record: a JSON object, or a stderr marker followed by an object
+// or by nothing at all.
 func looksLikeAudit(line []byte) bool {
-	return bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) || bytes.Contains(line, []byte("OCSF-JSON"))
+	trimmed := bytes.TrimSpace(line)
+	if bytes.HasPrefix(trimmed, []byte("{")) {
+		return true
+	}
+	if _, payload, found := bytes.Cut(trimmed, []byte(ocsfJSONMarker)); found {
+		payload = bytes.TrimSpace(payload)
+		return len(payload) == 0 || payload[0] == '{'
+	}
+	return bytes.HasSuffix(trimmed, bytes.TrimSpace([]byte(ocsfJSONMarker)))
 }
 
 // decodeLine extracts the JSON payload from a JSONL or stderr line and

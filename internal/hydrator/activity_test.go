@@ -148,6 +148,199 @@ func TestActivityRunAndLegacyIsolation(t *testing.T) {
 	}
 }
 
+func TestActivityOnlyDoesNotAccumulateLegacyPayload(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "new only"}, {name: "legacy kept", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := activityOptions(t)
+			if tc.legacy {
+				opts.Signals = DefaultSignalConfig()
+				opts.Signals.EmitActivity = true
+			}
+			agg, activity := newAggregators(opts)
+			if activity == nil {
+				t.Fatal("activity aggregator not built")
+			}
+			consumers := eventConsumers(agg, activity)
+			for _, uid := range []string{"1", "2", "3"} {
+				for _, consumer := range consumers {
+					consumer.add(Event{ClassUID: 4001, ActivityID: 1, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, DstEndpoint: &Endpoint{Domain: uid + ".example.com"}, Message: "CONNECT allowed example.com:443"})
+				}
+			}
+			st := agg.stats["agent-a"]
+			if st.events != 3 {
+				t.Fatal("summary attribution lost")
+			}
+			want := 0
+			if tc.legacy {
+				want = 3
+			}
+			if len(st.destinations) != want {
+				t.Fatalf("legacy destinations=%d want %d", len(st.destinations), want)
+			}
+			if got := activity.stats["agent-a"].measurements.Connections.Allowed; got != 3 {
+				t.Fatalf("activity connections allowed=%d, want 3", got)
+			}
+		})
+	}
+}
+
+func TestActivityAggregatorOnlyWhenRequested(t *testing.T) {
+	t.Parallel()
+	agg, activity := newAggregators(Options{Agents: sampleAgents(t), Signals: DefaultSignalConfig()})
+	if activity != nil || agg.skipLegacyStats {
+		t.Fatal("legacy-only run built the activity path")
+	}
+	if consumers := eventConsumers(agg, activity); len(consumers) != 1 {
+		t.Fatalf("consumers=%d, want the legacy aggregator only", len(consumers))
+	}
+	_, activity = newAggregators(Options{Agents: sampleAgents(t), Evidence: &bytes.Buffer{}})
+	if activity == nil {
+		t.Fatal("evidence-only run did not build the activity path")
+	}
+}
+
+func TestActivityFailureStatusKeepsLegacyBehavior(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "new only"}, {name: "legacy alongside", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := activityOptions(t)
+			if tc.legacy {
+				opts.Signals = DefaultSignalConfig()
+				opts.Signals.EmitActivity = true
+			}
+			input := activityInput(t, "allowed", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1) + "\n" + `{"class_uid":4001,"activity_id":4,"status_id":2,"time":1791996121000,"container":{"uid":"3949f6fc-2b84-45b2-a631-46debe41d84f"},"message":"Proxy connection error: connection refused"}`
+			sink := &fakeSink{}
+			report, err := Run(t.Context(), strings.NewReader(input), sink, opts, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Activity[0].Score == nil || *report.Activity[0].Score != 100 {
+				t.Fatal("connection failure penalized corrected score")
+			}
+			wantLegacyDenied := 0
+			if tc.legacy {
+				wantLegacyDenied = 1
+			}
+			if report.Agents[0].Denied != wantLegacyDenied {
+				t.Fatalf("legacy denied=%d, want %d", report.Agents[0].Denied, wantLegacyDenied)
+			}
+		})
+	}
+}
+
+func TestActivityConnectionOnlyTraffic(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		activityInput(t, "c1", "CONNECT allowed example.com:443", 4001, 1, 1),
+		activityInput(t, "c2", "CONNECT allowed example.com:443", 4001, 1, 1),
+		activityInput(t, "c3", "CONNECT allowed example.com:443", 4001, 1, 1),
+		activityInput(t, "c4", "CONNECT denied blocked.example.com:443", 4001, 1, 2),
+	}
+	sink := &fakeSink{}
+	report, err := Run(t.Context(), strings.NewReader(strings.Join(lines, "\n")), sink, activityOptions(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := report.Activity[0]
+	want := ActivityMeasurements{Connections: DecisionCounts{Allowed: 3, Denied: 1}}
+	if evidence.Measurements != want || evidence.Score == nil || *evidence.Score != 75 {
+		t.Fatalf("connection-only evidence=%+v", evidence)
+	}
+	if len(sink.batches) != 1 || len(sink.batches[0].Observations) != 1 {
+		t.Fatalf("connection-only score not posted: %+v", sink.batches)
+	}
+}
+
+func TestActivityDegradedAgentSkippedFromBatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "activity only"}, {name: "legacy alongside", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := activityOptions(t)
+			if tc.legacy {
+				opts.Signals = DefaultSignalConfig()
+				opts.Signals.EmitActivity = true
+			}
+			clean := activityInput(t, "a1", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1)
+			degraded := jsonLine(t, map[string]any{"class_uid": 4002, "activity_id": 99, "action_id": 1, "disposition_id": 1, "time": sampleBaseMs, "container": map[string]any{"name": sandboxBName}, "metadata": map[string]any{"uid": "b1"}, "message": "FUTURE_L7_FORMAT permitted=true"})
+			sink := &fakeSink{}
+			report, err := Run(t.Context(), strings.NewReader(clean+"\n"+degraded), sink, opts, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Activity) != 2 {
+				t.Fatalf("evidence=%+v, want one record per agent", report.Activity)
+			}
+			activityRows, legacyRows := 0, 0
+			for _, row := range sink.batches[0].Observations {
+				if row.SignalID == DefaultActivitySignal {
+					activityRows++
+					if row.AgentID != "agent-a" {
+						t.Fatalf("degraded agent posted a score: %+v", row)
+					}
+				} else {
+					legacyRows++
+				}
+			}
+			wantLegacy := 0
+			if tc.legacy {
+				wantLegacy = 4
+			}
+			if activityRows != 1 || legacyRows != wantLegacy {
+				t.Fatalf("activity rows=%d legacy rows=%d, want 1 and %d", activityRows, legacyRows, wantLegacy)
+			}
+		})
+	}
+}
+
+func TestActivityMeasurementsDenied(t *testing.T) {
+	t.Parallel()
+	measurements := ActivityMeasurements{
+		HTTPInitial:            DecisionCounts{Allowed: 9, Denied: 1},
+		PostRewriteEvaluations: DecisionCounts{Denied: 2, Audited: 5},
+		WebSocketEvaluations:   DecisionCounts{Denied: 3, Unknown: 7},
+		Connections:            DecisionCounts{Denied: 4},
+	}
+	if got := measurements.Denied(); got != 10 {
+		t.Fatalf("Denied()=%d, want 10", got)
+	}
+}
+
+func TestActivityObservationRequiresScore(t *testing.T) {
+	t.Parallel()
+	builder := observationBuilder{signals: SignalConfig{EmitActivity: true}.withDefaults()}
+	if _, err := builder.activity("agent", ActivityEvidence{Unavailable: activityIncomplete}); err == nil {
+		t.Fatal("expected an error for evidence without a score")
+	}
+	score := 67
+	row, err := builder.activity("agent", ActivityEvidence{Score: &score})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value ActivityScoreValue
+	if err := json.Unmarshal(row.Value, &value); err != nil || value.Score != 67 || row.SignalID != DefaultActivitySignal {
+		t.Fatalf("row=%+v value=%+v err=%v", row, value, err)
+	}
+}
+
 func TestActivityFindingOnlyAndFailures(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -220,7 +413,7 @@ func TestActivityDedupIsolation(t *testing.T) {
 			t.Parallel()
 			opts := activityOptions(t)
 			opts.Activity = tc.cfg
-			var lines []string
+			lines := make([]string, 0, 2*tc.count+1)
 			for i := range tc.count {
 				line := activityInput(t, strconv.Itoa(i), "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1)
 				lines = append(lines, line, line)
