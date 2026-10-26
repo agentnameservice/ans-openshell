@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -264,6 +265,28 @@ func TestActivityConnectionOnlyTraffic(t *testing.T) {
 	}
 }
 
+// OpenShell v0.1.5 logs the L7 decision before forwarding, so an upstream 503
+// appears only as an allowed request with no status or response fields.
+func TestActivityAllowedUpstreamFailure(t *testing.T) {
+	t.Parallel()
+	requests := []string{"r1", "r2", "r3"}
+	lines := make([]string, 0, 2*len(requests))
+	for _, uid := range requests {
+		lines = append(lines,
+			activityInput(t, uid+"-connect", "CONNECT_L7 allowed httpbingo.org:443", 4001, 1, 1),
+			activityInput(t, uid+"-request", "L7_REQUEST allow GET httpbingo.org:443/status/503 reason=", 4002, 99, 1))
+	}
+	report, err := Run(t.Context(), strings.NewReader(strings.Join(lines, "\n")), &fakeSink{}, activityOptions(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := report.Activity[0]
+	want := ActivityMeasurements{HTTPInitial: DecisionCounts{Allowed: 3}, Connections: DecisionCounts{Allowed: 3}}
+	if evidence.Measurements != want || evidence.Score == nil || *evidence.Score != 100 {
+		t.Fatalf("allowed upstream failures counted against the agent: %+v", evidence)
+	}
+}
+
 func TestActivityDegradedAgentSkippedFromBatch(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -311,7 +334,7 @@ func TestActivityDegradedAgentSkippedFromBatch(t *testing.T) {
 	}
 }
 
-func TestActivityMeasurementsDenied(t *testing.T) {
+func TestActivityMeasurementsTotals(t *testing.T) {
 	t.Parallel()
 	measurements := ActivityMeasurements{
 		HTTPInitial:            DecisionCounts{Allowed: 9, Denied: 1},
@@ -321,6 +344,9 @@ func TestActivityMeasurementsDenied(t *testing.T) {
 	}
 	if got := measurements.Denied(); got != 10 {
 		t.Fatalf("Denied()=%d, want 10", got)
+	}
+	if got := measurements.Audited(); got != 5 {
+		t.Fatalf("Audited()=%d, want 5", got)
 	}
 }
 
@@ -441,32 +467,62 @@ func TestActivityPolicyContext(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name        string
-		policyTime  int64
+		policyTimes []int64
 		wantUnknown bool
+		wantChanged bool
 	}{
-		{name: "policy before window", policyTime: sampleBaseMs - 1000},
-		{name: "policy after decision", policyTime: sampleBaseMs + 1000, wantUnknown: true},
+		{name: "policy before window", policyTimes: []int64{sampleBaseMs - 1000}},
+		{name: "policy after decision", policyTimes: []int64{sampleBaseMs + 1000}, wantUnknown: true, wantChanged: true},
+		{name: "policy changed mid window", policyTimes: []int64{sampleBaseMs - 1000, sampleBaseMs + 1000}, wantChanged: true},
 		{name: "missing policy", wantUnknown: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			opts := activityOptions(t)
 			opts.Window = &Window{Start: time.UnixMilli(sampleBaseMs), End: time.UnixMilli(sampleBaseMs + 2000)}
-			input := activityInput(t, "request", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1)
-			if tc.policyTime != 0 {
-				input += "\n" + jsonLine(t, map[string]any{"class_uid": 5019, "time": tc.policyTime, "container": map[string]any{"uid": sandboxAUID}, "unmapped": map[string]any{"policy_hash": "test-policy", "version": 1}})
+			lines := make([]string, 0, 1+len(tc.policyTimes))
+			lines = append(lines, activityInput(t, "request", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1))
+			for i, policyTime := range tc.policyTimes {
+				lines = append(lines, jsonLine(t, map[string]any{"class_uid": 5019, "time": policyTime, "container": map[string]any{"uid": sandboxAUID}, "unmapped": map[string]any{"policy_hash": "policy-" + strconv.Itoa(i), "version": 1}}))
 			}
-			report, err := Run(t.Context(), strings.NewReader(input), &fakeSink{}, opts, nil)
+			report, err := Run(t.Context(), strings.NewReader(strings.Join(lines, "\n")), &fakeSink{}, opts, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if report.Activity[0].PolicyUnknown != tc.wantUnknown {
-				t.Fatalf("policy=%+v", report.Activity[0])
+			evidence := report.Activity[0]
+			if evidence.PolicyUnknown != tc.wantUnknown || evidence.PolicyChanged != tc.wantChanged {
+				t.Fatalf("policy=%+v", evidence)
 			}
-			if tc.policyTime != 0 && len(report.Activity[0].Policies) != 1 {
+			if len(evidence.Policies) != len(tc.policyTimes) {
 				t.Fatal("policy context lost")
 			}
+			explanation := activityExplanation(evidence)
+			if strings.Contains(explanation, "loaded after counting began") != tc.wantChanged {
+				t.Fatalf("policy change not explained: %s", explanation)
+			}
+			for _, policy := range evidence.Policies {
+				if !strings.Contains(explanation, fmt.Sprintf("hash=%q version=%q", policy.Hash, policy.Version)) {
+					t.Fatalf("policy %q missing from explanation: %s", policy.Hash, explanation)
+				}
+			}
 		})
+	}
+}
+
+func TestActivityPolicySummaryBounds(t *testing.T) {
+	t.Parallel()
+	const policyCount = 5
+	policies := make([]PolicyContext, 0, policyCount)
+	for i := range policyCount {
+		policies = append(policies, PolicyContext{Hash: strings.Repeat("a", 64) + strconv.Itoa(i), Version: strconv.Itoa(i)})
+	}
+	score := 100
+	explanation := activityExplanation(ActivityEvidence{Score: &score, Policies: policies})
+	if strings.Count(explanation, " Policy hash=") != 4 || !strings.Contains(explanation, "1 additional policies in local evidence") {
+		t.Fatalf("policy summary not bounded: %s", explanation)
+	}
+	if !strings.Contains(explanation, `hash="aaaaaaaaaaaa" version="0"`) {
+		t.Fatalf("policy hash not shortened: %s", explanation)
 	}
 }
 

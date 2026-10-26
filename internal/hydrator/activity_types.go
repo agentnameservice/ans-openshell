@@ -63,6 +63,7 @@ type ActivityEvidence struct {
 	Diagnostics    map[string]int       `json:"diagnostics"`
 	Policies       []PolicyContext      `json:"policies"`
 	PolicyUnknown  bool                 `json:"policyUnknown"`
+	PolicyChanged  bool                 `json:"policyChanged"`
 	SampleSize     int                  `json:"sampleSize"`
 	Score          *int                 `json:"score"`
 	Unavailable    string               `json:"unavailableReason,omitempty"`

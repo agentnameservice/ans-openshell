@@ -47,7 +47,11 @@ Keep the signal at weight 0: its score is visible but does not affect trust
 decisions. **Do not use it in real trust decisions until the consumer can expire
 or otherwise invalidate old scores.** If the hydrator sends no new score, the
 reference implementation retains its previous score indefinitely, including 100.
-A later clean measurement window can replace an earlier low score. This producer
+A later clean measurement window can replace an earlier low score. Each
+observation is stamped with its window end, and the reference implementation
+ignores a repeat for the same agent, signal, and timestamp, so rerunning the same
+window (for example after a configuration fix) does not replace the stored score;
+only a later window does. This producer
 change adds neither consumer expiry nor a new scoreless-report API.
 
 ## Enable the new producer output
@@ -79,6 +83,13 @@ counts, reported status, finding origins and match counts, policy context, and
 diagnostics independently of the imported score. Findings do not change the score;
 eligible score explanations summarize them. Finding-only windows stay in this
 local output without inventing a numeric score.
+
+Policy context lists each policy hash and version seen for the agent's
+sandboxes. `policyChanged` is true when a sandbox loaded a policy after its
+first counted decision, so the counts may span more than one policy; the score
+is still sent. Score explanations name up to four policies by their first 12
+hash characters and say when a policy changed, so scores are compared only under
+the same policy. OpenShell's reload record carries a hash but no version.
 
 Unknown policy syntax, incomplete interpretation, and exhausted deduplication
 budgets suppress the affected agent's new score and record the reason. Other

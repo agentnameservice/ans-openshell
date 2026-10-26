@@ -374,6 +374,6 @@ func logActivity(ctx context.Context, logger *slog.Logger, evidence []hydrator.A
 		}
 		logger.Log(ctx, level, "activity summary", "agent_id", item.AgentID,
 			"score", score, "sample_size", item.SampleSize, "denied", item.Measurements.Denied(),
-			"unavailable_reason", item.Unavailable)
+			"audited", item.Measurements.Audited(), "unavailable_reason", item.Unavailable)
 	}
 }

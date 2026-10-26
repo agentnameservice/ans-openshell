@@ -401,6 +401,7 @@ func (s *activityStats) evidence(id string, window Window, minimum int, input au
 		Diagnostics:    diagnostics,
 		Policies:       policies,
 		PolicyUnknown:  !s.hasPolicyContext(policies),
+		PolicyChanged:  s.policyChanged(policies),
 		SampleSize:     sample,
 		Score:          score,
 		Unavailable:    reason,
@@ -425,6 +426,15 @@ func (s *activityStats) hasPolicyContext(policies []PolicyContext) bool {
 		}
 	}
 	return true
+}
+
+// policyChanged reports whether a sandbox loaded a policy after its first
+// counted decision, so the counts may span more than one policy.
+func (s *activityStats) policyChanged(policies []PolicyContext) bool {
+	return slices.ContainsFunc(policies, func(p PolicyContext) bool {
+		first, counted := s.firstDecision[p.Sandbox]
+		return counted && p.ObservedAt.UnixMilli() > first
+	})
 }
 
 func activitySandbox(ev Event) string {
@@ -462,6 +472,7 @@ func activityExplanation(ev ActivityEvidence) string {
 	if ev.PolicyUnknown {
 		out.WriteString(" Policy context unknown.")
 	}
+	out.WriteString(activityPolicySummary(ev))
 	// Bound the explanation; full finding details remain in the separate structured output.
 	const summaryLimit = 8
 	// Middleware and type come from audit records; quoting keeps them from reading as explanation text.
@@ -471,6 +482,28 @@ func activityExplanation(ev ActivityEvidence) string {
 	}
 	if len(ev.Findings) > summaryLimit {
 		fmt.Fprintf(&out, " %d additional finding groups in local evidence.", len(ev.Findings)-summaryLimit)
+	}
+	return out.String()
+}
+
+// activityPolicySummary names the policies behind the counts, so consumers
+// compare scores only under the same policy.
+func activityPolicySummary(ev ActivityEvidence) string {
+	const (
+		policyLimit     = 4
+		shortHashLength = 12
+	)
+	var out strings.Builder
+	if ev.PolicyChanged {
+		out.WriteString(" A policy was loaded after counting began; counts may span more than one policy.")
+	}
+	// Hashes and versions come from audit records; quoting keeps them from reading as explanation text.
+	for _, p := range ev.Policies[:min(len(ev.Policies), policyLimit)] {
+		hash := strings.ToValidUTF8(p.Hash[:min(len(p.Hash), shortHashLength)], "")
+		fmt.Fprintf(&out, " Policy hash=%q version=%q.", hash, p.Version)
+	}
+	if len(ev.Policies) > policyLimit {
+		fmt.Fprintf(&out, " %d additional policies in local evidence.", len(ev.Policies)-policyLimit)
 	}
 	return out.String()
 }

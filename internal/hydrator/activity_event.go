@@ -40,6 +40,13 @@ const (
 	minimumJSONRPCTokens   = 3
 )
 
+const (
+	connectKeyword        = "CONNECT"
+	connectL7Keyword      = "CONNECT_L7"
+	jsonRPCRequestKeyword = "JSONRPC_L7_REQUEST"
+	transparentTCPAllowed = "transparent_tcp_allowed"
+)
+
 type classifiedActivity struct {
 	Group         activityGroup
 	Decision      policyDecision
@@ -110,11 +117,11 @@ func (r activityRecord) statesDecision() bool {
 	if _, isL7 := l7DecisionGroup(r.tokens); isL7 {
 		return true
 	}
-	if len(r.tokens) >= 2 && (r.tokens[0] == "CONNECT" || r.tokens[0] == "CONNECT_L7") {
-		return r.tokens[1] == "allowed" || r.tokens[1] == "denied"
+	if connectDecision(r.tokens) != decisionUnknown {
+		return true
 	}
 	return strings.HasPrefix(r.Message, "Transparent TCP denied") ||
-		strings.HasPrefix(r.Message, "Transparent TCP ") && r.StatusDetail == "transparent_tcp_allowed"
+		strings.HasPrefix(r.Message, "Transparent TCP ") && r.StatusDetail == transparentTCPAllowed
 }
 
 func (r activityRecord) withoutDecisionEnums() bool {
@@ -287,7 +294,7 @@ func l7DecisionGroup(tokens []string) (activityGroup, bool) {
 		return "", false
 	}
 	switch tokens[0] {
-	case "L7_REQUEST", "GRAPHQL_L7_REQUEST", "JSONRPC_L7_REQUEST":
+	case "L7_REQUEST", "GRAPHQL_L7_REQUEST", jsonRPCRequestKeyword:
 		return groupHTTPInitial, true
 	case "L7_REQUEST_TRANSFORMED":
 		return groupPostRewrite, true
@@ -312,7 +319,7 @@ func classifyL7Decision(record activityRecord) (classifiedActivity, bool) {
 		return unknownActivity(group), true
 	}
 	token := parts[1]
-	if parts[0] == "JSONRPC_L7_REQUEST" {
+	if parts[0] == jsonRPCRequestKeyword {
 		if !strings.HasPrefix(token, "decision=") || activityMessageValue(record.Message, "http_method") == "" || activityMessageValue(record.Message, "endpoint") == "" {
 			return unknownActivity(group), true
 		}
@@ -369,29 +376,36 @@ func classifyConnectionActivity(record activityRecord) classifiedActivity {
 		}
 		return unknownActivity(groupConnections)
 	}
-	parts := record.tokens
 	decision := decisionUnknown
-	if len(parts) >= minimumJSONRPCTokens && (parts[0] == "CONNECT" || parts[0] == "CONNECT_L7") {
-		switch parts[1] {
-		case "allowed":
-			decision = decisionAllowed
-		case "denied":
-			decision = decisionDenied
-		}
-	} else if strings.HasPrefix(record.Message, "Transparent TCP ") {
+	if len(record.tokens) >= minimumJSONRPCTokens {
+		decision = connectDecision(record.tokens)
+	}
+	if decision == decisionUnknown && strings.HasPrefix(record.Message, "Transparent TCP ") {
 		decision = transparentPolicyDecision(record.Event)
 	}
 	if decision != decisionUnknown && decisionEnumsMatch(record.Event, decision) {
 		return classifiedActivity{Group: groupConnections, Decision: decision}
 	}
-	if record.withoutDecisionEnums() && !strings.HasPrefix(record.Message, "CONNECT") && !strings.HasPrefix(record.Message, "Transparent TCP ") {
+	if record.withoutDecisionEnums() && !strings.HasPrefix(record.Message, connectKeyword) && !strings.HasPrefix(record.Message, "Transparent TCP ") {
 		return classifiedActivity{Diagnostic: "network_no_policy_decision"}
 	}
 	return unknownActivity(groupConnections)
 }
 
+// connectDecision returns the decision stated by a CONNECT or CONNECT_L7
+// message, or decisionUnknown for any other message.
+func connectDecision(tokens []string) policyDecision {
+	if len(tokens) < 2 || (tokens[0] != connectKeyword && tokens[0] != connectL7Keyword) {
+		return decisionUnknown
+	}
+	if decision := policyDecision(tokens[1]); decision == decisionAllowed || decision == decisionDenied {
+		return decision
+	}
+	return decisionUnknown
+}
+
 func transparentPolicyDecision(ev Event) policyDecision {
-	if ev.StatusDetail == "transparent_tcp_allowed" && !strings.HasPrefix(ev.Message, "Transparent TCP denied") {
+	if ev.StatusDetail == transparentTCPAllowed && !strings.HasPrefix(ev.Message, "Transparent TCP denied") {
 		return decisionAllowed
 	}
 	if strings.HasPrefix(ev.Message, "Transparent TCP denied") {

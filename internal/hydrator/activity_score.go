@@ -53,11 +53,20 @@ func (m ActivityMeasurements) groups() []DecisionCounts {
 
 // Denied returns the denied policy decisions across all measurement groups.
 func (m ActivityMeasurements) Denied() int {
-	denied := 0
+	return m.sum(func(counts DecisionCounts) int { return counts.Denied })
+}
+
+// Audited returns the audited policy decisions across all measurement groups.
+func (m ActivityMeasurements) Audited() int {
+	return m.sum(func(counts DecisionCounts) int { return counts.Audited })
+}
+
+func (m ActivityMeasurements) sum(count func(DecisionCounts) int) int {
+	total := 0
 	for _, counts := range m.groups() {
-		denied += counts.Denied
+		total += count(counts)
 	}
-	return denied
+	return total
 }
 
 func assessActivity(m ActivityMeasurements, minimum int, unavailable string) (*int, string, int) {
