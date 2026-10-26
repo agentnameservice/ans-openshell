@@ -130,3 +130,119 @@ func TestSignerBindsMethodURLAndContent(t *testing.T) {
 		t.Fatal("Sign accepted a relative URL")
 	}
 }
+
+func TestNewSelfSignedSigner(t *testing.T) {
+	t.Parallel()
+	const ansName = "ans://v9.9.9.rogue.example"
+
+	signer, key, cert, err := NewSelfSignedSigner(ansName)
+	if err != nil {
+		t.Fatalf("NewSelfSignedSigner: %v", err)
+	}
+	if signer == nil {
+		t.Fatal("signer is nil")
+	}
+	if key == nil {
+		t.Fatal("key is nil")
+	}
+	if cert == nil {
+		t.Fatal("cert is nil")
+	}
+
+	// Check cert has exactly one URI SAN matching ansName
+	if len(cert.URIs) != 1 {
+		t.Fatalf("cert.URIs has %d entries, want 1", len(cert.URIs))
+	}
+	if cert.URIs[0].String() != ansName {
+		t.Fatalf("cert.URIs[0] = %q, want %q", cert.URIs[0].String(), ansName)
+	}
+
+	// Check cert public key is ECDSA P-256
+	pubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("cert public key type = %T, want *ecdsa.PublicKey", cert.PublicKey)
+	}
+	if pubKey.Curve != elliptic.P256() {
+		t.Fatalf("cert public key curve = %v, want P-256", pubKey.Curve)
+	}
+
+	// Check cert validity window
+	now := time.Now()
+	if cert.NotBefore.After(now) {
+		t.Fatalf("cert.NotBefore = %v is after now", cert.NotBefore)
+	}
+	if cert.NotAfter.Before(now) {
+		t.Fatalf("cert.NotAfter = %v is before now", cert.NotAfter)
+	}
+
+	// Check that the returned key is the key that signed the cert
+	if !key.PublicKey.Equal(pubKey) {
+		t.Fatal("returned key does not match cert's public key")
+	}
+
+	// Sign twice and verify both proofs embed the same cert fingerprint
+	const method, target = http.MethodGet, "https://example.com/test"
+	contentDigest := sha256.Sum256(nil)
+
+	proof1, err := signer.Sign(t.Context(), method, target, contentDigest)
+	if err != nil {
+		t.Fatalf("Sign #1: %v", err)
+	}
+	proof2, err := signer.Sign(t.Context(), method, target, contentDigest)
+	if err != nil {
+		t.Fatalf("Sign #2: %v", err)
+	}
+
+	// Parse and verify both proofs
+	replay := pop.NewMemoryReplayCache(t.Context(), 0)
+	defer replay.Close()
+
+	res1, err := pop.VerifyProof(t.Context(), proof1, method, target, time.Now(), 0, replay)
+	if err != nil {
+		t.Fatalf("VerifyProof #1: %v", err)
+	}
+	res2, err := pop.VerifyProof(t.Context(), proof2, method, target, time.Now(), 0, replay)
+	if err != nil {
+		t.Fatalf("VerifyProof #2: %v", err)
+	}
+
+	if res1.Fingerprint != res2.Fingerprint {
+		t.Fatalf("fingerprints differ: %x vs %x", res1.Fingerprint, res2.Fingerprint)
+	}
+
+	// Verify the fingerprint matches the cert
+	expectedFingerprint := sha256.Sum256(cert.Raw)
+	if res1.Fingerprint != expectedFingerprint {
+		t.Fatalf("fingerprint = %x, want %x", res1.Fingerprint, expectedFingerprint)
+	}
+}
+
+func TestNewSelfSignedSigner_BadName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		ansName string
+	}{
+		{name: "not an ans name", ansName: "not-an-ans-name"},
+		{name: "empty", ansName: ""},
+		{name: "http scheme", ansName: "http://v1.0.0.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			signer, key, cert, err := NewSelfSignedSigner(tt.ansName)
+			if err == nil {
+				t.Fatalf("NewSelfSignedSigner(%q) succeeded, want error", tt.ansName)
+			}
+			if signer != nil {
+				t.Fatal("signer is not nil")
+			}
+			if key != nil {
+				t.Fatal("key is not nil")
+			}
+			if cert != nil {
+				t.Fatal("cert is not nil")
+			}
+		})
+	}
+}

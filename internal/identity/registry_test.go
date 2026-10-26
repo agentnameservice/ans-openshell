@@ -263,3 +263,181 @@ func TestNewRegistryEmpty(t *testing.T) {
 		t.Fatalf("empty registry: names %v healthy %v", reg.Names(), reg.Healthy())
 	}
 }
+
+func TestRegistry_DevModeIdentity(t *testing.T) {
+	t.Parallel()
+	// Capture log output to verify dev-mode warning
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	identities := map[string]Config{
+		"rogue": {
+			AnsName: "ans://v9.9.9.rogue.example",
+			AgentID: "rogue-0001",
+			DevMode: true,
+		},
+	}
+
+	reg, err := NewRegistry(t.Context(), identities, config.TransparencyLog{}, logger)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	defer reg.Close()
+
+	// Verify identity was built
+	id, ok := reg.Identity("rogue")
+	if !ok {
+		t.Fatal("identity 'rogue' not found")
+	}
+
+	// Verify it has expected properties
+	if id.AnsName() != "ans://v9.9.9.rogue.example" {
+		t.Errorf("AnsName() = %q, want %q", id.AnsName(), "ans://v9.9.9.rogue.example")
+	}
+	if id.AgentID() != "rogue-0001" {
+		t.Errorf("AgentID() = %q, want %q", id.AgentID(), "rogue-0001")
+	}
+
+	// Verify the Signer works
+	proof, err := id.Signer().Sign(t.Context(), "GET", "https://example.com/", [32]byte{})
+	if err != nil {
+		t.Fatalf("Signer.Sign: %v", err)
+	}
+	if proof == "" {
+		t.Error("Signer.Sign returned empty proof")
+	}
+
+	// Verify Artifacts are non-empty
+	arts := id.Artifacts().Current()
+	if arts.StatusTokenBase64 == "" {
+		t.Error("StatusTokenBase64 is empty")
+	}
+	if arts.ReceiptBase64 == "" {
+		t.Error("ReceiptBase64 is empty")
+	}
+
+	// Verify the source is healthy
+	if !id.Artifacts().Healthy() {
+		t.Error("Artifacts().Healthy() = false")
+	}
+
+	// Verify dev-mode warning was logged
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "dev-mode") {
+		t.Errorf("log output missing 'dev-mode': %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "WARN") {
+		t.Errorf("log output missing 'WARN': %s", logOutput)
+	}
+}
+
+func TestRegistry_DevModeDefaultsFalse(t *testing.T) {
+	t.Parallel()
+	tl := testfixtures.MustNewTL()
+	id := testfixtures.MustNewIdentity(testAgentID, testAnsName)
+	srv := testfixtures.FakeTLServer(tl, id)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	keyFile, certFile := writeIdentityFiles(t, dir, "id", id)
+
+	identities := map[string]Config{
+		"file-based": {
+			AnsName:  testAnsName,
+			AgentID:  id.AgentID,
+			KeyFile:  keyFile,
+			CertFile: certFile,
+			// DevMode not set, should default to false
+		},
+	}
+	tlCfg := config.TransparencyLog{BaseURL: srv.URL, RootKeys: []string{tl.RootKeyC2SP()}, AllowInsecureTransport: true}
+
+	reg, err := NewRegistry(t.Context(), identities, tlCfg, nil)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	defer reg.Close()
+
+	// Verify identity was built via file path (not dev mode)
+	ident, ok := reg.Identity("file-based")
+	if !ok {
+		t.Fatal("identity 'file-based' not found")
+	}
+
+	// Verify it works (can sign and has artifacts)
+	if _, err := ident.Signer().Sign(t.Context(), "GET", "https://example.com/", [32]byte{}); err != nil {
+		t.Fatalf("Signer.Sign: %v", err)
+	}
+	if !ident.Artifacts().Healthy() {
+		t.Error("Artifacts().Healthy() = false")
+	}
+}
+
+func TestRegistry_DevModeRejectsFilePaths(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "key.pem")
+	certFile := filepath.Join(dir, "cert.pem")
+
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr string
+	}{
+		{
+			name: "dev_mode with key_file",
+			cfg: Config{
+				AnsName: "ans://v9.9.9.rogue.example",
+				AgentID: "rogue-0001",
+				DevMode: true,
+				KeyFile: keyFile,
+			},
+			wantErr: "dev_mode must not set key_file/cert_file",
+		},
+		{
+			name: "dev_mode with cert_file",
+			cfg: Config{
+				AnsName:  "ans://v9.9.9.rogue.example",
+				AgentID:  "rogue-0001",
+				DevMode:  true,
+				CertFile: certFile,
+			},
+			wantErr: "dev_mode must not set key_file/cert_file",
+		},
+		{
+			name: "dev_mode with receipt_file",
+			cfg: Config{
+				AnsName:     "ans://v9.9.9.rogue.example",
+				AgentID:     "rogue-0001",
+				DevMode:     true,
+				ReceiptFile: filepath.Join(dir, "receipt.cose"),
+			},
+			wantErr: "dev_mode must not set",
+		},
+		{
+			name: "dev_mode with status_token_file",
+			cfg: Config{
+				AnsName:         "ans://v9.9.9.rogue.example",
+				AgentID:         "rogue-0001",
+				DevMode:         true,
+				StatusTokenFile: filepath.Join(dir, "token.cose"),
+			},
+			wantErr: "dev_mode must not set",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			identities := map[string]Config{"test": tt.cfg}
+			reg, err := NewRegistry(t.Context(), identities, config.TransparencyLog{}, nil)
+			if err == nil {
+				reg.Close()
+				t.Fatal("NewRegistry() succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("NewRegistry() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
