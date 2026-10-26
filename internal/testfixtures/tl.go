@@ -96,4 +96,3 @@ func (t *TL) Receipt(agentID, ansName string) []byte {
 	must(err)
 	return receipt
 }
-
