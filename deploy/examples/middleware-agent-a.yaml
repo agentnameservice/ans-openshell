@@ -17,8 +17,8 @@ identities:
   buyer-agent:
     ans_name: ans://v2.0.0.buyer.example.com
     agent_id: 00000000-0000-0000-0000-000000000000
-    key_file: /.secrets/example.com/key.pem
-    cert_file: /.secrets/example.com/cert.pem
+    key_file: /.secrets/buyer.example.com/key.pem
+    cert_file: /.secrets/buyer.example.com/cert.pem
     dev_mode: false
 sandbox_identities: {}
 vetting:
@@ -34,7 +34,7 @@ commerce:
   authority_ans: ans://v1.0.8.authority.skybound-travel.com
   scope_hint: purchase:flight:demo
   subject_ans: ans://v2.0.0.buyer.example.com
-  commerce_dpop_key_path: /.secrets/example.com/commerce-dpop.pem
+  commerce_dpop_key_path: /.secrets/buyer.example.com/commerce-dpop.pem
   demo_quote_id: demo-quote-001
   demo_amount: 500
   demo_currency: USD

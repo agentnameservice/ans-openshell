@@ -50,6 +50,10 @@ type Outcome struct {
 	Body    []byte // Set only for Allow
 	Reason  string // Set only for Deny
 	SignURL string // Set only for Allow: externally-visible URL for identity proof htu binding
+	// MandateBytes and DPoPProof expose the artifacts spliced into an Allow'd
+	// body, for observability only (debug narration). Not used for control flow.
+	MandateBytes []byte // Set only for Allow: the authority's raw mandate JSON
+	DPoPProof    string // Set only for Allow: the minted compact DPoP JWS
 }
 
 // RewriteBookFlight orchestrates mandate fetching and DPoP injection for book_flight requests.
@@ -183,5 +187,5 @@ func RewriteBookFlight(ctx context.Context, body []byte, d Deps, cfg Config, htu
 		return Outcome{Kind: Deny, Reason: fmt.Sprintf("oversize: %d > %d", len(rewritten), cfg.MaxBodyBytes)}
 	}
 
-	return Outcome{Kind: Allow, Body: rewritten, SignURL: htu}
+	return Outcome{Kind: Allow, Body: rewritten, SignURL: htu, MandateBytes: rawMandateBytes, DPoPProof: proof}
 }

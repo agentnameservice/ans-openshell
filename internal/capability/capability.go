@@ -69,6 +69,12 @@ type Outcome struct {
 	Body    []byte // Set only for Allow
 	Reason  string // Set only for Deny
 	SignURL string // Set only for Allow
+	// MandateBytes and DPoPProof carry the artifacts a transform attached to an
+	// Allow'd request, for observability only (debug narration). Both may be
+	// empty when the transform attaches no such artifacts. They are never used
+	// for control flow.
+	MandateBytes []byte // Set only for Allow, when the transform attached a mandate
+	DPoPProof    string // Set only for Allow, when the transform minted a DPoP proof
 }
 
 // Target describes the request being evaluated: the destination (Host, Method, Path)

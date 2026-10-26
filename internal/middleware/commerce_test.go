@@ -190,6 +190,13 @@ func TestCommerce_AppliesViaDiscoveredRequirement(t *testing.T) {
 	if len(outcome.Body) == 0 {
 		t.Fatal("expected body for Allow, got none")
 	}
+	// The Allow must surface the attached artifacts for debug narration.
+	if len(outcome.MandateBytes) == 0 {
+		t.Error("expected MandateBytes surfaced on Allow, got none")
+	}
+	if outcome.DPoPProof == "" {
+		t.Error("expected DPoPProof surfaced on Allow, got empty")
+	}
 }
 
 func TestCommerce_AppliesViaStaticFallbackWhenEmpty(t *testing.T) {

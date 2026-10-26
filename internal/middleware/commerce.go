@@ -64,10 +64,12 @@ func (r *commerceRewriter) Apply(ctx context.Context, target capability.Target, 
 	// Delegate to commerce.RewriteBookFlight with discovered htu
 	outcome := commerce.RewriteBookFlight(ctx, body, r.deps, r.cfg, htuOverride)
 	return capability.Outcome{
-		Kind:    capability.OutcomeKind(outcome.Kind),
-		Body:    outcome.Body,
-		Reason:  outcome.Reason,
-		SignURL: outcome.SignURL,
+		Kind:         capability.OutcomeKind(outcome.Kind),
+		Body:         outcome.Body,
+		Reason:       outcome.Reason,
+		SignURL:      outcome.SignURL,
+		MandateBytes: outcome.MandateBytes,
+		DPoPProof:    outcome.DPoPProof,
 	}
 }
 

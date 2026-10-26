@@ -19,6 +19,7 @@ import (
 	"github.com/agentnameservice/ans-openshell/gen/openshell/extensionv1"
 	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
 	"github.com/agentnameservice/ans-openshell/internal/capability"
+	"github.com/agentnameservice/ans-openshell/internal/commerce"
 	"github.com/agentnameservice/ans-openshell/internal/extauth"
 	"github.com/agentnameservice/ans-openshell/internal/identity"
 	"github.com/agentnameservice/ans-openshell/internal/vetting"
@@ -328,6 +329,10 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 			out.setBody(tr.Body)
 			// G1: capture SignURL from transforms (last writer wins).
 			signURL = tr.SignURL
+			// Observability only: when debug is on, decode and log the artifacts
+			// the transform attached (proof claims + mandate summary). Never
+			// affects control flow; decoding is skipped unless debug is enabled.
+			s.narrateArtifacts(ctx, tr)
 		case capability.Passthrough:
 			// Continue to next transform
 		}
@@ -433,6 +438,33 @@ func (s *Service) attach(ctx context.Context, id *identity.Identity, method, tar
 	out.meta(MetadataAnsName, id.AnsName())
 	out.meta(MetadataAgentID, id.AgentID())
 	return nil
+}
+
+// narrateArtifacts logs, at DEBUG only, the decoded artifacts a transform
+// attached to an Allow'd request: the minted DPoP proof's claims and the
+// authority mandate's summary. It is observability for the demo narrator and
+// has no effect on the request. Decoding is skipped entirely unless the logger
+// is at debug, so there is no cost (and nothing is emitted) in normal operation.
+func (s *Service) narrateArtifacts(ctx context.Context, tr capability.Outcome) {
+	if !s.log.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	if tr.DPoPProof != "" {
+		if c, err := commerce.DecodeDPoPClaims(tr.DPoPProof); err == nil {
+			s.log.DebugContext(ctx, "dpop proof minted",
+				"htm", c.Htm, "htu", c.Htu, "ath", c.Ath, "iat", c.Iat, "jti", c.Jti)
+		}
+	}
+	if len(tr.MandateBytes) > 0 {
+		if m, err := commerce.SummarizeMandate(tr.MandateBytes); err == nil {
+			s.log.DebugContext(ctx, "mandate attached",
+				"mandate_id", m.MandateID, "scope", m.Scope,
+				"max_amount", m.MaxAmount, "currency", m.Currency,
+				"jkt", m.JKT, "subject_ans", m.SubjectANS,
+				"authority_ans", m.AuthorityANS,
+				"not_before", m.NotBefore, "not_after", m.NotAfter)
+		}
+	}
 }
 
 func destinationSeverity(st vetting.Status) string {
