@@ -63,13 +63,51 @@ func (r *commerceRewriter) Apply(ctx context.Context, target capability.Target, 
 
 	// Delegate to commerce.RewriteBookFlight with discovered htu
 	outcome := commerce.RewriteBookFlight(ctx, body, r.deps, r.cfg, htuOverride)
-	return capability.Outcome{
-		Kind:         capability.OutcomeKind(outcome.Kind),
-		Body:         outcome.Body,
-		Reason:       outcome.Reason,
-		SignURL:      outcome.SignURL,
-		MandateBytes: outcome.MandateBytes,
-		DPoPProof:    outcome.DPoPProof,
+	out := capability.Outcome{
+		Kind:    capability.OutcomeKind(outcome.Kind),
+		Body:    outcome.Body,
+		Reason:  outcome.Reason,
+		SignURL: outcome.SignURL,
+	}
+	// Stash the attached artifacts for observability (narration only). The core
+	// treats Artifacts as opaque; r.Narrate decodes them.
+	if outcome.Kind == commerce.Allow {
+		out.Artifacts = map[string]any{
+			artifactMandateBytes: outcome.MandateBytes,
+			artifactDPoPProof:    outcome.DPoPProof,
+		}
+	}
+	return out
+}
+
+// Artifact keys stashed in capability.Outcome.Artifacts for narration.
+const (
+	artifactMandateBytes = "mandate_bytes"
+	artifactDPoPProof    = "dpop_proof"
+)
+
+// Narrate implements capability.Narratable: at debug level, it decodes and logs
+// the DPoP proof claims and mandate summary this transform attached. It is
+// observability only and never affects the request.
+func (r *commerceRewriter) Narrate(ctx context.Context, out capability.Outcome, log *slog.Logger) {
+	if !log.Enabled(ctx, slog.LevelDebug) || out.Artifacts == nil {
+		return
+	}
+	if proof, ok := out.Artifacts[artifactDPoPProof].(string); ok && proof != "" {
+		if c, err := commerce.DecodeDPoPClaims(proof); err == nil {
+			log.DebugContext(ctx, "dpop proof minted",
+				"htm", c.Htm, "htu", c.Htu, "ath", c.Ath, "iat", c.Iat, "jti", c.Jti)
+		}
+	}
+	if mb, ok := out.Artifacts[artifactMandateBytes].([]byte); ok && len(mb) > 0 {
+		if m, err := commerce.SummarizeMandate(mb); err == nil {
+			log.DebugContext(ctx, "mandate attached",
+				"mandate_id", m.MandateID, "scope", m.Scope,
+				"max_amount", m.MaxAmount, "currency", m.Currency,
+				"jkt", m.JKT, "subject_ans", m.SubjectANS,
+				"authority_ans", m.AuthorityANS,
+				"not_before", m.NotBefore, "not_after", m.NotAfter)
+		}
 	}
 }
 

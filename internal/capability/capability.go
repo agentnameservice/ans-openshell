@@ -4,7 +4,10 @@
 // result from applying transforms (Outcome).
 package capability
 
-import "context"
+import (
+	"context"
+	"log/slog"
+)
 
 // Capability represents a capability identifier from the card vocabulary
 // (e.g., "mandate", "dpop_proof") or an extension URI.
@@ -69,12 +72,12 @@ type Outcome struct {
 	Body    []byte // Set only for Allow
 	Reason  string // Set only for Deny
 	SignURL string // Set only for Allow
-	// MandateBytes and DPoPProof carry the artifacts a transform attached to an
-	// Allow'd request, for observability only (debug narration). Both may be
-	// empty when the transform attaches no such artifacts. They are never used
-	// for control flow.
-	MandateBytes []byte // Set only for Allow, when the transform attached a mandate
-	DPoPProof    string // Set only for Allow, when the transform minted a DPoP proof
+	// Artifacts is an optional, transform-defined bag of values describing what
+	// the transform attached to an Allow'd request (e.g. a mandate or a proof).
+	// It is for observability only (debug narration) and is never used for
+	// control flow. The core does not interpret its contents; a transform that
+	// also implements Narratable renders them.
+	Artifacts map[string]any
 }
 
 // Target describes the request being evaluated: the destination (Host, Method, Path)
@@ -98,4 +101,13 @@ type Transform interface {
 	// Deny with a reason if the request should be rejected,
 	// or Allow with an optionally modified body if the request should proceed.
 	Apply(ctx context.Context, target Target, req Requirement, body []byte) Outcome
+}
+
+// Narratable is an OPTIONAL interface a Transform may implement to render, at
+// debug level, a human-readable view of the artifacts it attached to an Allow'd
+// request (the Outcome it returned). The core calls it for observability only;
+// it never affects the request, and a Transform that does not implement it is
+// simply not narrated.
+type Narratable interface {
+	Narrate(ctx context.Context, out Outcome, log *slog.Logger)
 }

@@ -190,12 +190,12 @@ func TestCommerce_AppliesViaDiscoveredRequirement(t *testing.T) {
 	if len(outcome.Body) == 0 {
 		t.Fatal("expected body for Allow, got none")
 	}
-	// The Allow must surface the attached artifacts for debug narration.
-	if len(outcome.MandateBytes) == 0 {
-		t.Error("expected MandateBytes surfaced on Allow, got none")
+	// The Allow must surface the attached artifacts (for debug narration).
+	if mb, ok := outcome.Artifacts[artifactMandateBytes].([]byte); !ok || len(mb) == 0 {
+		t.Error("expected mandate bytes in Artifacts on Allow, got none")
 	}
-	if outcome.DPoPProof == "" {
-		t.Error("expected DPoPProof surfaced on Allow, got empty")
+	if proof, ok := outcome.Artifacts[artifactDPoPProof].(string); !ok || proof == "" {
+		t.Error("expected dpop proof in Artifacts on Allow, got empty")
 	}
 }
 
