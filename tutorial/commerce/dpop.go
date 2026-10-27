@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/agentnameservice/ans-openshell/internal/commercekey"
+	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
 )
 
 const (

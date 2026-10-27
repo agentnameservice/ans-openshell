@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentnameservice/ans-openshell/internal/commercekey"
+	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
 )
 
 func TestParseMandateResponse_Success(t *testing.T) {

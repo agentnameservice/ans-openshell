@@ -1,4 +1,4 @@
-package middleware
+package transform
 
 import (
 	"context"
@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/agentnameservice/ans-openshell/tutorial/commerce"
 	"github.com/agentnameservice/ans-openshell/internal/capability"
-	"github.com/agentnameservice/ans-openshell/internal/commerce"
 )
 
 // commerceRewriter implements capability.Transform with discovery-aware + lenient fallback logic.

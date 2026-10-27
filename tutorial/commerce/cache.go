@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agentnameservice/ans-openshell/internal/commercekey"
+	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
 )
 
 const skewSecs = 60

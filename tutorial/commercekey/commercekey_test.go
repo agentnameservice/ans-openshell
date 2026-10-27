@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentnameservice/ans-openshell/internal/commercekey"
+	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
 )
 
 func TestLoad_FileAndEnvShadow(t *testing.T) {

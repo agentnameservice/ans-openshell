@@ -1,4 +1,4 @@
-package middleware
+package transform
 
 import (
 	"context"
@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agentnameservice/ans-openshell/tutorial/commerce"
+	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
 	"github.com/agentnameservice/ans-openshell/internal/capability"
-	"github.com/agentnameservice/ans-openshell/internal/commerce"
-	"github.com/agentnameservice/ans-openshell/internal/commercekey"
 )
 
 // panicAuthority panics if RequestMandate is called, proving the gate skipped.
