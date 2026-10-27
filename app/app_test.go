@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bytes"
@@ -19,6 +19,9 @@ import (
 	"github.com/agentnameservice/ans-openshell/internal/middleware"
 	"github.com/agentnameservice/ans-openshell/internal/testfixtures"
 )
+
+// version stands in for the build-time version in these tests.
+const version = "test"
 
 func TestServeSandboxApprovals(t *testing.T) {
 	t.Parallel()
@@ -45,7 +48,7 @@ func TestServeSandboxApprovals(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), startupTimeout)
 			defer cancel()
 			logs := &startupLogWriter{cancel: cancel}
-			err := serve(ctx, cfg, slog.New(slog.NewTextHandler(logs, nil)))
+			err := serve(ctx, cfg, options{version: version}, slog.New(slog.NewTextHandler(logs, nil)))
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("serve() error = %v, want %q before listener validation", err, tt.wantErr)
@@ -64,7 +67,7 @@ func TestServeSandboxApprovals(t *testing.T) {
 
 // loadStartupConfig writes a complete middleware configuration with one static
 // identity; auth is the indented body of the auth block.
-func loadStartupConfig(t *testing.T, approval, auth, healthListen string) fileConfig {
+func loadStartupConfig(t *testing.T, approval, auth, healthListen string) Config {
 	t.Helper()
 	dir := t.TempDir()
 	id := testfixtures.MustNewIdentity("test-agent-id", "ans://v1.0.0.test.example")
@@ -102,7 +105,7 @@ sandbox_identities: %s
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var cfg fileConfig
+	var cfg Config
 	if err := config.Load(path, &cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -126,31 +129,31 @@ func TestServiceConfig(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		cfg  fileConfig
+		cfg  Config
 		want middleware.Config
 	}{
 		{
 			name: "vetting budget propagates",
-			cfg: fileConfig{Auth: config.Auth{Audience: "aud"}, MaxPayloadBytes: 1024, RequestTimeout: time.Second,
+			cfg: Config{Auth: config.Auth{Audience: "aud"}, MaxPayloadBytes: 1024, RequestTimeout: time.Second,
 				Vetting: &config.Vetting{RequestBudget: 150 * time.Millisecond}},
 			want: middleware.Config{Audience: "aud", MaxPayloadBytes: 1024, RequestTimeout: time.Second,
 				ImplementationVersion: version, VettingBudget: 150 * time.Millisecond, RequireAuthenticatedCaller: true},
 		},
 		{
 			name: "no vetting block",
-			cfg:  fileConfig{Auth: config.Auth{Audience: "aud"}},
+			cfg:  Config{Auth: config.Auth{Audience: "aud"}},
 			want: middleware.Config{Audience: "aud", ImplementationVersion: version, RequireAuthenticatedCaller: true},
 		},
 		{
 			name: "insecure local mode does not require an authenticated caller",
-			cfg:  fileConfig{Auth: config.Auth{AllowInsecureNoAuth: true}},
+			cfg:  Config{Auth: config.Auth{AllowInsecureNoAuth: true}},
 			want: middleware.Config{ImplementationVersion: version},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := serviceConfig(tt.cfg); got != tt.want {
+			if got := serviceConfig(tt.cfg, version); got != tt.want {
 				t.Fatalf("serviceConfig() = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -215,7 +218,7 @@ func TestServeNotReadyWithoutGatewayKeys(t *testing.T) {
 	defer cancel()
 	logs := newHealthLogWatcher()
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, cfg, slog.New(slog.NewTextHandler(logs, nil))) }()
+	go func() { done <- serve(ctx, cfg, options{version: version}, slog.New(slog.NewTextHandler(logs, nil))) }()
 	if code := readyzStatus(ctx, t, logs); code != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz without gateway keys = %d, want 503", code)
 	}
