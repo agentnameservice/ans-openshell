@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agentnameservice/ans-openshell/internal/capability"
 	"github.com/agentnameservice/ans-openshell/tutorial/commerce"
 	"github.com/agentnameservice/ans-openshell/tutorial/commercekey"
-	"github.com/agentnameservice/ans-openshell/internal/capability"
 )
 
 // panicAuthority panics if RequestMandate is called, proving the gate skipped.

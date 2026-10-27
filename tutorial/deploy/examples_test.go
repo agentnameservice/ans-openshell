@@ -9,10 +9,15 @@ import (
 
 	"github.com/agentnameservice/ans-openshell/internal/config"
 	"github.com/agentnameservice/ans-openshell/internal/identity"
+	tutorialcfg "github.com/agentnameservice/ans-openshell/tutorial/config"
 )
 
-// middlewareFile mirrors the unexported fileConfig from cmd/ans-openshell-middleware/main.go
-// for testing example YAML files.
+// examplesDir is the path to the demo example configs, which live in the core
+// repo's deploy/examples directory (this test lives in the tutorial module).
+const examplesDir = "../../deploy/examples/"
+
+// middlewareFile mirrors the demo binary's fileConfig (cmd/ans-demo-middleware):
+// the generic middleware config plus the tutorial commerce block.
 type middlewareFile struct {
 	Listen            string                     `yaml:"listen"`
 	HealthListen      string                     `yaml:"health_listen"`
@@ -24,7 +29,7 @@ type middlewareFile struct {
 	Vetting           *config.Vetting            `yaml:"vetting"`
 	MaxPayloadBytes   uint64                     `yaml:"max_payload_bytes"`
 	RequestTimeout    time.Duration              `yaml:"request_timeout"`
-	Commerce          config.Commerce            `yaml:"commerce"`
+	Commerce          tutorialcfg.Commerce       `yaml:"commerce"`
 }
 
 // loadMiddlewareFile loads a middleware YAML config into the mirror struct.
@@ -38,7 +43,7 @@ func loadMiddlewareFile(t *testing.T, path string) middlewareFile {
 }
 
 func TestExampleConfig_AgentA(t *testing.T) {
-	cfg := loadMiddlewareFile(t, "examples/middleware-agent-a.yaml")
+	cfg := loadMiddlewareFile(t, examplesDir+"middleware-agent-a.yaml")
 
 	if cfg.Listen != ":50051" {
 		t.Errorf("Listen = %q, want :50051", cfg.Listen)
@@ -89,7 +94,7 @@ func TestExampleConfig_AgentA(t *testing.T) {
 }
 
 func TestExampleConfig_AgentB(t *testing.T) {
-	cfg := loadMiddlewareFile(t, "examples/middleware-agent-b.yaml")
+	cfg := loadMiddlewareFile(t, examplesDir+"middleware-agent-b.yaml")
 
 	if cfg.Listen != ":50052" {
 		t.Errorf("Listen = %q, want :50052", cfg.Listen)
@@ -129,11 +134,11 @@ func TestExampleConfig_AgentB(t *testing.T) {
 
 func TestDemoWiring_NamesAndHostsAgree(t *testing.T) {
 	// Parse the two sandbox policies
-	policyA := loadPolicyFile(t, "examples/policy-a.yaml")
-	policyB := loadPolicyFile(t, "examples/policy-b.yaml")
+	policyA := loadPolicyFile(t, examplesDir+"policy-a.yaml")
+	policyB := loadPolicyFile(t, examplesDir+"policy-b.yaml")
 
 	// Parse the Tier 2 gateway registration
-	gatewayMiddlewares := loadGatewayTier2(t, "examples/gateway-tier2.toml")
+	gatewayMiddlewares := loadGatewayTier2(t, examplesDir+"gateway-tier2.toml")
 
 	// (G2) Check that policy-a network_middlewares key AND its .middleware value == "ans-egress-a"
 	// and that it matches a gateway middleware name

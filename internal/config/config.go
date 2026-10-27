@@ -118,69 +118,6 @@ type Vetting struct {
 	ExemptHosts []string `yaml:"exempt_hosts"`
 }
 
-// Commerce configures the commerce rewriter for Tier 2 demo.
-type Commerce struct {
-	// SellerMCPURL is the seller's MCP endpoint URL (used as DPoP htu).
-	SellerMCPURL string `yaml:"seller_mcp_url"`
-	// AuthorityMCPURL is the authority's MCP endpoint URL.
-	AuthorityMCPURL string `yaml:"authority_mcp_url"`
-	// SellerANS is the seller's ANS identifier.
-	SellerANS string `yaml:"seller_ans"`
-	// AuthorityANS is the authority's ANS identifier.
-	AuthorityANS string `yaml:"authority_ans"`
-	// ScopeHint is the expected scope prefix for mandates.
-	ScopeHint string `yaml:"scope_hint"`
-	// SubjectANS is the subject ANS identifier for mandate requests.
-	SubjectANS string `yaml:"subject_ans"`
-	// CommerceDPoPKeyPath is the path to the commerce DPoP key JSON file.
-	CommerceDPoPKeyPath string `yaml:"commerce_dpop_key_path"`
-	// DemoQuoteID is the quote ID for demo mandate prefetch.
-	DemoQuoteID string `yaml:"demo_quote_id"`
-	// DemoAmount is the amount for demo mandate prefetch.
-	DemoAmount float64 `yaml:"demo_amount"`
-	// DemoCurrency is the currency for demo mandate prefetch.
-	DemoCurrency string `yaml:"demo_currency"`
-	// MaxBodyBytes is the maximum body size after rewriting.
-	MaxBodyBytes int `yaml:"max_body_bytes"`
-	// DiscoveryTTL is the agent-card/tools-list discovery cache TTL; 0 means the default.
-	DiscoveryTTL time.Duration `yaml:"discovery_ttl"`
-}
-
-// Enabled reports whether commerce is configured.
-func (c Commerce) Enabled() bool {
-	return c.CommerceDPoPKeyPath != "" || os.Getenv("COMMERCE_DPOP_KEY") != ""
-}
-
-// Validate checks that required fields are set when Enabled.
-func (c Commerce) Validate() error {
-	if !c.Enabled() {
-		return nil
-	}
-	var missing []string
-	if c.SellerMCPURL == "" {
-		missing = append(missing, "seller_mcp_url")
-	}
-	if c.AuthorityMCPURL == "" {
-		missing = append(missing, "authority_mcp_url")
-	}
-	if c.SellerANS == "" {
-		missing = append(missing, "seller_ans")
-	}
-	if c.AuthorityANS == "" {
-		missing = append(missing, "authority_ans")
-	}
-	if c.ScopeHint == "" {
-		missing = append(missing, "scope_hint")
-	}
-	if c.SubjectANS == "" {
-		missing = append(missing, "subject_ans")
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("commerce: missing %v", missing)
-	}
-	return nil
-}
-
 // Load reads the YAML file at path into dst, rejecting unknown fields so a
 // misspelled key cannot silently disable a control.
 func Load(path string, dst any) error {

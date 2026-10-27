@@ -1020,27 +1020,6 @@ func TestEvaluate_CredentialMarkerOnFinalBytes(t *testing.T) {
 	}
 }
 
-// stubDiscoverer implements capability.Discoverer.
-type stubDiscoverer struct {
-	req capability.Requirement
-}
-
-func (s stubDiscoverer) Discover(_ context.Context, _ capability.Target) capability.Requirement {
-	return s.req
-}
-
-// syncLogWriter wraps a bytes.Buffer with mutex for race-free log capture.
-type syncLogWriter struct {
-	w  *bytes.Buffer
-	mu *sync.Mutex
-}
-
-func (sw *syncLogWriter) Write(p []byte) (int, error) {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-	return sw.w.Write(p)
-}
-
 func TestEvaluate_TransformSignURLBindsIdentityProof(t *testing.T) { //nolint:tparallel // subtests share signer state
 	t.Parallel()
 
