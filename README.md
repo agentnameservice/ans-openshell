@@ -173,9 +173,11 @@ fingerprint against the status token's valid identity certificates, checks the c
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md): Developer Certificate of Origin sign-off on every commit,
-Conventional Commits, and disclosure of AI assistance. Security issues go to the address in
-[SECURITY.md](SECURITY.md).
+This repository follows [ANS governance](https://github.com/agentnameservice/governance/blob/main/GOVERNANCE.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
+[MAINTAINERS.md](MAINTAINERS.md) for the repository's Maintainers.
+The [Code of Conduct](CODE_OF_CONDUCT.md) applies to participation;
+report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 
 ## License
 
