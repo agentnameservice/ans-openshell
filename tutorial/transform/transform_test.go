@@ -548,3 +548,27 @@ func TestCommerce_SurfacesSignURL(t *testing.T) { //nolint:tparallel // subtests
 		}
 	})
 }
+
+// TestCapabilityKind pins the commerce.OutcomeKind -> capability.OutcomeKind
+// mapping. Apply relies on it, and a silent Deny/Allow swap would be a
+// security defect; this fails if either enum is reordered.
+func TestCapabilityKind(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   commerce.OutcomeKind
+		want capability.OutcomeKind
+	}{
+		{commerce.Passthrough, capability.Passthrough},
+		{commerce.Deny, capability.Deny},
+		{commerce.Allow, capability.Allow},
+	}
+	for _, c := range cases {
+		if got := capabilityKind(c.in); got != c.want {
+			t.Errorf("capabilityKind(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	// An unknown kind must fail closed to Deny, never Allow.
+	if got := capabilityKind(commerce.OutcomeKind(99)); got != capability.Deny {
+		t.Errorf("capabilityKind(unknown) = %v, want Deny (fail closed)", got)
+	}
+}

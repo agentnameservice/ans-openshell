@@ -32,13 +32,6 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-// fileConfig is the YAML the demo binary loads: the generic app.Config plus the
-// tutorial commerce block.
-type fileConfig struct {
-	app.Config `yaml:",inline"`
-	Commerce   tutorialcfg.Commerce `yaml:"commerce"`
-}
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ans-demo-middleware:", err)
@@ -66,7 +59,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var cfg fileConfig
+	var cfg tutorialcfg.FileConfig
 	if err := config.Load(*configPath, &cfg); err != nil {
 		return err
 	}

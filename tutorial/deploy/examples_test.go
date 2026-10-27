@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/agentnameservice/ans-openshell/internal/config"
 	"github.com/agentnameservice/ans-openshell/internal/identity"
@@ -16,26 +15,12 @@ import (
 // repo's deploy/examples directory (this test lives in the tutorial module).
 const examplesDir = "../../deploy/examples/"
 
-// middlewareFile mirrors the demo binary's fileConfig (cmd/ans-demo-middleware):
-// the generic middleware config plus the tutorial commerce block.
-type middlewareFile struct {
-	Listen            string                     `yaml:"listen"`
-	HealthListen      string                     `yaml:"health_listen"`
-	TLS               config.TLS                 `yaml:"tls"`
-	Auth              config.Auth                `yaml:"auth"`
-	TransparencyLog   config.TransparencyLog     `yaml:"transparency_log"`
-	Identities        map[string]identity.Config `yaml:"identities"`
-	SandboxIdentities map[string]string          `yaml:"sandbox_identities"`
-	Vetting           *config.Vetting            `yaml:"vetting"`
-	MaxPayloadBytes   uint64                     `yaml:"max_payload_bytes"`
-	RequestTimeout    time.Duration              `yaml:"request_timeout"`
-	Commerce          tutorialcfg.Commerce       `yaml:"commerce"`
-}
-
-// loadMiddlewareFile loads a middleware YAML config into the mirror struct.
-func loadMiddlewareFile(t *testing.T, path string) middlewareFile {
+// loadMiddlewareFile loads a middleware YAML config into the exact type the demo
+// binary loads (tutorialcfg.FileConfig), so this test exercises the real
+// config-loading path rather than a hand-maintained mirror.
+func loadMiddlewareFile(t *testing.T, path string) tutorialcfg.FileConfig {
 	t.Helper()
-	var cfg middlewareFile
+	var cfg tutorialcfg.FileConfig
 	if err := config.Load(path, &cfg); err != nil {
 		t.Fatalf("failed to load %s: %v", path, err)
 	}

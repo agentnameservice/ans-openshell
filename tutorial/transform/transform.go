@@ -64,7 +64,7 @@ func (r *commerceRewriter) Apply(ctx context.Context, target capability.Target, 
 	// Delegate to commerce.RewriteBookFlight with discovered htu
 	outcome := commerce.RewriteBookFlight(ctx, body, r.deps, r.cfg, htuOverride)
 	out := capability.Outcome{
-		Kind:    capability.OutcomeKind(outcome.Kind),
+		Kind:    capabilityKind(outcome.Kind),
 		Body:    outcome.Body,
 		Reason:  outcome.Reason,
 		SignURL: outcome.SignURL,
@@ -78,6 +78,24 @@ func (r *commerceRewriter) Apply(ctx context.Context, target capability.Target, 
 		}
 	}
 	return out
+}
+
+// capabilityKind maps a commerce.OutcomeKind to the capability.OutcomeKind the
+// core understands. It is an explicit switch rather than a numeric conversion
+// (capability.OutcomeKind(k)) so the two enums are not assumed to share integer
+// values: reordering either one is caught by TestCapabilityKind rather than
+// silently swapping Deny and Allow. An unknown kind fails closed to Deny.
+func capabilityKind(k commerce.OutcomeKind) capability.OutcomeKind {
+	switch k {
+	case commerce.Passthrough:
+		return capability.Passthrough
+	case commerce.Allow:
+		return capability.Allow
+	case commerce.Deny:
+		return capability.Deny
+	default:
+		return capability.Deny
+	}
 }
 
 // Artifact keys stashed in capability.Outcome.Artifacts for narration.

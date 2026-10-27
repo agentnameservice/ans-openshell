@@ -2,9 +2,14 @@
 // that signs a sandbox's outbound requests as its registered ANS agent.
 //
 // This is the production binary: generic middleware only. Capability transforms
-// such as the commerce tutorial are NOT built in; they live in the demo module
-// (demo/cmd/ans-demo-middleware), which reuses the same app.Run and registers
-// its transform via an option.
+// such as the commerce tutorial are NOT built in; they live in the tutorial
+// module (tutorial/cmd/ans-demo-middleware), which reuses the same app.Run and
+// registers its transform via an option.
+//
+// Because app.Config has no commerce field and the config loader is strict
+// (unknown keys are errors), this binary rejects a config that still carries a
+// commerce: block. That block belongs to the demo binary; see the tutorial
+// module and deploy/live-demo.
 package main
 
 import (

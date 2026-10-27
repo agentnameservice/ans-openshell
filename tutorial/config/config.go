@@ -7,7 +7,18 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/agentnameservice/ans-openshell/app"
 )
+
+// FileConfig is the YAML shape the demo binary loads: the generic middleware
+// app.Config inlined, plus the tutorial Commerce block. Both the demo binary
+// (tutorial/cmd/ans-demo-middleware) and the example-config test use this type,
+// so the two cannot drift from each other.
+type FileConfig struct {
+	app.Config `yaml:",inline"`
+	Commerce   Commerce `yaml:"commerce"`
+}
 
 // Commerce configures the commerce capability transform (AP2 mandate + DPoP).
 type Commerce struct {
