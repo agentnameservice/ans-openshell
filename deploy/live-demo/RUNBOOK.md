@@ -32,10 +32,13 @@ Other machine-local material under `$WORK` (see README §one-time-setup):
 `bin/openshell` (CLI v0.1.5), `pki/` (gateway mTLS+JWT), `tl-root-keys.txt`
 (pinned GoDaddy TL root keys).
 
-Build the binaries:
+Build the binaries (the demo egress is `ans-demo-middleware` — the production
+middleware plus the commerce tutorial transform; `make demo-build` generates a
+gitignored `go.work` so the `tutorial/` module resolves the in-repo core):
 
 ```sh
-cd $REPO && make build      # ./bin/ans-openshell-middleware, ./bin/ans-reference-callee
+cd $REPO && make demo-build    # ./bin/ans-demo-middleware (demo egress)
+cd $REPO && make build         # ./bin/ans-reference-callee (ingress)
 ```
 
 Fill the configs from the templates in this directory (absolute paths,
@@ -75,8 +78,8 @@ one is unreachable — so **egresses first, gateway last**.
 
 ```sh
 cd $WORK
-$REPO/bin/ans-openshell-middleware --config $WORK/agent-a-local.yaml --log-level info >egress-a.log 2>&1 &
-$REPO/bin/ans-openshell-middleware --config $WORK/agent-b-local.yaml --log-level info >egress-b.log 2>&1 &
+$REPO/bin/ans-demo-middleware --config $WORK/agent-a-local.yaml --log-level info >egress-a.log 2>&1 &
+$REPO/bin/ans-demo-middleware --config $WORK/agent-b-local.yaml --log-level info >egress-b.log 2>&1 &
 $WORK/bin/openshell-gateway --config $WORK/gw.toml \
   --port 17670 --bind-address 0.0.0.0 --health-port 17671 --log-level info >gateway.log 2>&1 &
 ```

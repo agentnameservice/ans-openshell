@@ -53,8 +53,14 @@ Nothing here is committed.
 
 1. **Build the Go binaries** (from the repo root):
    ```sh
-   make build          # produces ./bin/ans-openshell-middleware and ./bin/ans-reference-callee
+   make demo-build     # produces ./bin/ans-demo-middleware (the demo egress binary)
+   make build          # produces ./bin/ans-reference-callee (used as the ingress)
    ```
+   The demo runs `ans-demo-middleware` — the production middleware plus the
+   commerce tutorial transform. The shipped `ans-openshell-middleware` binary
+   (from `make build`) is pure middleware with no commerce code, so the demo
+   does not use it. `make demo-build` generates a gitignored `go.work` so the
+   `tutorial/` module resolves the in-repo core.
 
 2. **Lay out `$WORK`** (`~/openshell-live` by default):
    - `bin/openshell` — the OpenShell CLI (v0.1.5).
@@ -85,8 +91,8 @@ Nothing here is committed.
    # egress A and B (the script also restarts these per run, but the gateway
    # needs them up at its own boot — render them first by running the script
    # once, or start from the configs run-demo.sh writes into $WORK):
-   "$REPO/bin/ans-openshell-middleware" --config "$WORK/agent-a-local.yaml" --log-level info &
-   "$REPO/bin/ans-openshell-middleware" --config "$WORK/agent-b-local.yaml" --log-level info &
+   "$REPO/bin/ans-demo-middleware" --config "$WORK/agent-a-local.yaml" --log-level info &
+   "$REPO/bin/ans-demo-middleware" --config "$WORK/agent-b-local.yaml" --log-level info &
 
    # gateway:
    "$WORK/bin/openshell-gateway" --config "$WORK/gw.toml" \

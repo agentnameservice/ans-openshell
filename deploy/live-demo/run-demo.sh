@@ -94,7 +94,7 @@ done
 export OPENSHELL_GATEWAY_ENDPOINT
 
 OSH="${OPENSHELL:-$WORK/bin/openshell}"
-MW_BIN="${MW_BIN:-$REPO/bin/ans-openshell-middleware}"
+MW_BIN="${MW_BIN:-$REPO/bin/ans-demo-middleware}"
 SELLER_URL="$SELLER_MCP_URL"
 BODY="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"book_flight\",\"arguments\":{\"quote_id\":\"$DEMO_QUOTE_ID\",\"amount\":$DEMO_AMOUNT,\"currency\":\"$DEMO_CURRENCY\"}}}"
 
@@ -139,7 +139,7 @@ fi
 # --- preflight ---------------------------------------------------------------
 info "preflight"
 [ -x "$OSH" ] || fail "openshell CLI not found/executable at $OSH (set OPENSHELL=... or bin/openshell under WORK)"
-[ -x "$MW_BIN" ] || fail "middleware binary not at $MW_BIN — run 'make build' in $REPO (or set MW_BIN=...)"
+[ -x "$MW_BIN" ] || fail "demo middleware binary not at $MW_BIN — run 'make demo-build' in $REPO (or set MW_BIN=...)"
 for f in "$BUYER_KEY_FILE" "$BUYER_CERT_FILE" "$BUYER_COMMERCE_DPOP_KEY" "$TL_ROOT_KEYS_FILE"; do
   [ -f "$f" ] || fail "missing identity/key file: $f (the agent owner supplies the 3 PEMs out-of-band; see SECRETS.md)"
 done
