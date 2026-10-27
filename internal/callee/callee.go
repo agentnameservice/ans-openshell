@@ -313,7 +313,7 @@ func forwardToSeller(w http.ResponseWriter, r *http.Request, sellerURL string, c
 	upstreamURL := sellerURL + r.URL.Path
 
 	// Build the upstream request with the same body and Content-Type.
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body)) //nolint:gosec // G704: upstreamURL is sellerURL (operator config) + verified path
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		logger.ErrorContext(r.Context(), "build upstream request", "err", err)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)

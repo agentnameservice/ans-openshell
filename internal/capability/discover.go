@@ -161,7 +161,7 @@ func (d *HTTPDiscoverer) fetchURL(ctx context.Context, url string) ([]byte, erro
 		return nil, err
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Do(req) //nolint:gosec // G704: url is derived from the egress target host (policy-scoped), not request input
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +195,7 @@ func (d *HTTPDiscoverer) fetchToolsList(ctx context.Context, mcpURL string) ([]b
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Do(req) //nolint:gosec // G704: mcpURL is derived from the egress target host (policy-scoped), not request input
 	if err != nil {
 		return nil, err
 	}

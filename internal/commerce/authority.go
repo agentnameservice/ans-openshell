@@ -101,7 +101,7 @@ func (h *HTTPAuthority) RequestMandate(ctx context.Context, in MandateInput) (*M
 	req.Header.Set("Content-Type", "application/json")
 
 	// Send request
-	resp, err := h.client.Do(req)
+	resp, err := h.client.Do(req) //nolint:gosec // G704: authority URL is operator configuration, not request input
 	if err != nil {
 		return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
