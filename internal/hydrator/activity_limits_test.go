@@ -84,9 +84,10 @@ func TestActivityGlobalBudgetReleasesOwner(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			agg := newActivityAggregator(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"a"}}, AgentMapping{AgentID: "b", SandboxUIDs: []string{"b"}}, AgentMapping{AgentID: "c", SandboxUIDs: []string{"c"}}), nil, ActivityConfig{MaxUIDs: tc.limit})
+			agg := newActivityAggregator(nil, ActivityConfig{MaxUIDs: tc.limit})
+			attr := newAttributor(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"a"}}, AgentMapping{AgentID: "b", SandboxUIDs: []string{"b"}}, AgentMapping{AgentID: "c", SandboxUIDs: []string{"c"}}), nil, agg)
 			for _, record := range []struct{ agent, uid string }{{"a", "a1"}, {"a", "a2"}, {"b", "b1"}, {"c", "c1"}} {
-				agg.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: record.agent}, Metadata: Metadata{UID: record.uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
+				attr.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: record.agent}, Metadata: Metadata{UID: record.uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
 			}
 			for i, evidence := range agg.evidence(Window{}, auditInputHealth{}) {
 				if (evidence.Score == nil) != tc.wantUnavailable[i] {
@@ -103,17 +104,17 @@ func TestActivityGlobalBudgetReleasesOwner(t *testing.T) {
 func TestActivityDenialCoverage(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name            string
-		dns, tcp        int
-		destination     string
-		wantUnavailable bool
+		name           string
+		dns, tcp       int
+		destination    string
+		wantDiagnostic int
 	}{
 		{name: "paired shapes", dns: 1, tcp: 1, destination: "example.com"},
 		{name: "long valid domain", dns: 1, tcp: 1, destination: strings.Repeat("a", 60) + "." + strings.Repeat("b", 60) + ".example.com"},
 		{name: "raw IP", tcp: 1, destination: "192.0.2.1"},
-		{name: "orphan DNS", dns: 1, destination: "example.com", wantUnavailable: true},
-		{name: "extra DNS", dns: 2, tcp: 1, destination: "example.com", wantUnavailable: true},
-		{name: "missing destination", dns: 1, tcp: 1, wantUnavailable: true},
+		{name: "orphan DNS", dns: 1, destination: "example.com", wantDiagnostic: 1},
+		{name: "extra DNS", dns: 2, tcp: 1, destination: "example.com", wantDiagnostic: 2},
+		{name: "missing destination", dns: 1, tcp: 1, wantDiagnostic: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -127,14 +128,42 @@ func TestActivityDenialCoverage(t *testing.T) {
 				st.recordDenialCoverage(ev, false)
 			}
 			evidence := st.evidence("agent", Window{}, 1, auditInputHealth{})
-			if (evidence.Score == nil) != tc.wantUnavailable {
-				t.Fatalf("evidence=%+v", evidence)
+			if evidence.Score == nil || *evidence.Score != 100 || evidence.Diagnostics["unrepresented_dns_refusals"] != tc.wantDiagnostic {
+				t.Fatalf("evidence=%+v, want score 100 with %d unrepresented refusals", evidence, tc.wantDiagnostic)
 			}
 			if again := st.evidence("agent", Window{}, 1, auditInputHealth{}); !reflect.DeepEqual(again, evidence) {
 				t.Fatalf("evidence is not repeatable: first=%+v second=%+v", evidence, again)
 			}
 			if _, mutated := st.diagnostics["unrepresented_dns_refusals"]; mutated || st.unavailable != "" {
 				t.Fatal("evidence modified the accumulated state")
+			}
+		})
+	}
+}
+
+func TestActivityDenialCoverageLimits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		record func(*activityStats)
+	}{
+		{name: "destination length", record: func(st *activityStats) {
+			st.recordDenialCoverage(Event{DstEndpoint: &Endpoint{Domain: strings.Repeat("x", maxActivityFieldBytes+1)}}, true)
+		}},
+		{name: "destination cardinality", record: func(st *activityStats) {
+			for i := range maxActivityDetails + 1 {
+				st.recordDenialCoverage(Event{DstEndpoint: &Endpoint{Domain: strconv.Itoa(i)}}, true)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newActivityStats()
+			st.measurements.Connections = DecisionCounts{Allowed: 1, Denied: 1}
+			tc.record(st)
+			evidence := st.evidence("agent", Window{}, 1, auditInputHealth{})
+			if st.unavailable != "" || evidence.Score == nil || *evidence.Score != 50 || evidence.Diagnostics["denial_coverage_limit"] != 1 {
+				t.Fatalf("coverage limit withheld the score or lost the diagnostic: %+v", evidence)
 			}
 		})
 	}
@@ -155,14 +184,6 @@ func TestActivityBoundedMetadata(t *testing.T) {
 			}
 		}},
 		{name: "missing time", mutate: func(st *activityStats) { st.recordDecisionTime(Event{Container: &Container{Name: "probe"}}) }},
-		{name: "destination length", mutate: func(st *activityStats) {
-			st.recordDenialCoverage(Event{DstEndpoint: &Endpoint{Domain: strings.Repeat("x", maxActivityFieldBytes+1)}}, true)
-		}},
-		{name: "destination cardinality", mutate: func(st *activityStats) {
-			for i := range maxActivityDetails + 1 {
-				st.recordDenialCoverage(Event{DstEndpoint: &Endpoint{Domain: strconv.Itoa(i)}}, true)
-			}
-		}},
 		{name: "unexpected group", mutate: func(st *activityStats) { st.addDecision("future", "allow") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,16 +286,18 @@ func TestActivityMetadataAndExplanation(t *testing.T) {
 func TestActivityUnreadableAuditRecords(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name, extra, reason string
-		truncatedTail       int
+		name, extra   string
+		unreadable    int
+		truncatedTail int
 	}{
 		{name: "ordinary stderr", extra: "ordinary supervisor log\n"},
-		{name: "malformed audit", extra: "OCSF-JSON {broken\n", reason: activityUnreadableRecords},
-		{name: "malformed audit before valid records", extra: "{\"class_uid\":4002,\n" + `{"class_uid":4001}` + "\n", reason: activityUnreadableRecords},
-		{name: "oversized audit", extra: "{" + strings.Repeat(" ", MaxLineBytes) + "}\n", reason: activityUnreadableRecords},
+		{name: "malformed audit", extra: "OCSF-JSON {broken\n", unreadable: 1},
+		{name: "malformed audit before valid records", extra: "{\"class_uid\":4002,\n" + `{"class_uid":4001}` + "\n", unreadable: 1},
+		{name: "oversized audit", extra: "{" + strings.Repeat(" ", MaxLineBytes) + "}\n", unreadable: 1},
 		{name: "oversized ordinary stderr", extra: "ordinary log " + strings.Repeat("x", MaxLineBytes) + "\n"},
 		{name: "final line still being written", extra: `{"class_uid":4002,"activity_id":99,"container":{"na`, truncatedTail: 1},
 		{name: "marker text inside an ordinary log line", extra: "CONNECT allowed OCSF-JSON.attacker.example:443\n"},
+		{name: "marker copy inside a shorthand line", extra: stderrTimestamp + " OCSF NET:OPEN [MED] DENIED example.com:443 [reason:JSONRPC_L7_REQUEST deny example.com:443/rpc method=x rule_methods=OCSF-JSON {broken]\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -284,13 +307,38 @@ func TestActivityUnreadableAuditRecords(t *testing.T) {
 				t.Fatal(err)
 			}
 			evidence := report.Activity[0]
-			if evidence.Unavailable != tc.reason || evidence.Diagnostics["truncated_final_line"] != tc.truncatedTail {
+			if evidence.Unavailable != "" || evidence.Score == nil || *evidence.Score != 100 {
+				t.Fatalf("unreadable input withheld the score: %+v", evidence)
+			}
+			if evidence.Diagnostics[activityUnreadableRecords] != tc.unreadable || report.UnreadableAuditRecords != tc.unreadable {
+				t.Fatalf("unreadable diagnostic=%d report=%d, want %d", evidence.Diagnostics[activityUnreadableRecords], report.UnreadableAuditRecords, tc.unreadable)
+			}
+			if evidence.Diagnostics["truncated_final_line"] != tc.truncatedTail {
 				t.Fatalf("evidence=%+v", evidence)
 			}
-			if tc.reason == "" && (evidence.Score == nil || *evidence.Score != 100) {
-				t.Fatalf("readable input lost its score: %+v", evidence)
-			}
 		})
+	}
+}
+
+func TestActivityUnreadableRecordsDoNotStopOtherAgents(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		activityInput(t, "a1", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1),
+		jsonLine(t, map[string]any{"class_uid": 4002, "activity_id": 99, "action_id": 2, "disposition_id": 2, "time": sampleBaseMs, "container": map[string]any{"name": sandboxBName}, "metadata": map[string]any{"uid": "b1"}, "message": "L7_REQUEST deny POST example.com:443/test reason=rule"}),
+		"OCSF-JSON {broken",
+	}
+	sink := &fakeSink{}
+	report, err := Run(t.Context(), strings.NewReader(strings.Join(lines, "\n")+"\n"), sink, activityOptions(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.batches) != 1 || len(sink.batches[0].Observations) != 2 {
+		t.Fatalf("batches=%+v, want one score per agent", sink.batches)
+	}
+	for _, evidence := range report.Activity {
+		if evidence.Score == nil || evidence.Diagnostics[activityUnreadableRecords] != 1 {
+			t.Fatalf("agent %s: score withheld or diagnostic missing: %+v", evidence.AgentID, evidence)
+		}
 	}
 }
 
@@ -310,9 +358,10 @@ func TestActivityUnreadableRecordsKeepEarlierReason(t *testing.T) {
 
 func TestActivityOversizedEventUID(t *testing.T) {
 	t.Parallel()
-	agg := newActivityAggregator(sampleAgents(t), nil, ActivityConfig{})
+	agg := newActivityAggregator(nil, ActivityConfig{})
+	attr := newAttributor(sampleAgents(t), nil, agg)
 	for _, uid := range []string{"ordinary", strings.Repeat("u", maxActivityText+1)} {
-		agg.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
+		attr.add(Event{ClassUID: 4002, ActivityID: 99, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, Message: "L7_REQUEST allow GET example.com:443/test reason=rule"})
 	}
 	evidence := agg.evidence(Window{}, auditInputHealth{})[0]
 	if evidence.Unavailable != activityIncomplete || evidence.Diagnostics["oversized_event_uid"] != 1 {

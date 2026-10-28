@@ -108,13 +108,18 @@ later agents proceed within the same memory budget. A budget too small for the
 whole deployment can still make several agents unavailable.
 
 An audit-shaped line that cannot be decoded or exceeds 1 MiB (a JSON object,
-or a stderr line whose `OCSF-JSON ` marker is followed by an object or by
-nothing) cannot be attributed to a sandbox, so it withholds every agent's score
-with `unreadable_audit_records`. Ordinary log lines that merely mention the
-marker do not. Such a line has no readable timestamp, so the window cannot
-exclude it: it withholds scores on every run until the input file rotates. Keep
-the input to OpenShell audit records only; JSON logs from other programs whose
-fields do not match the OCSF types count as unreadable.
+or a line in the supervisor's `{ts} OCSF-JSON ` framing whose marker is
+followed by an object or by nothing) cannot be attributed to a sandbox. Scores
+are still sent; the count is recorded as `unreadable_audit_records` in every
+agent's diagnostics, the run logs one warning, and the job exits non-zero after
+posting unless `--allow-unmapped` is set. The marker must be a whole token
+with no `[` before it, which rejects shorthand copies preceded by a bracketed
+severity tag. The parser does not validate timestamp text before the marker,
+so an ordinary log line such as `INFO received OCSF-JSON {broken` still counts
+as unreadable. Such a line has no readable timestamp, so the window cannot
+exclude it: it is reported on every run until the input file rotates.
+Keep the input to OpenShell audit records only; JSON logs from other programs
+whose fields do not match the OCSF types count as unreadable.
 
 A final line without a trailing newline is treated as a record still being
 written: it is counted as `truncated_final_line` and does not withhold scores.
@@ -122,10 +127,20 @@ The next run counts it only if its timestamp falls inside that run's window, so
 set the window longer than the schedule interval (for example `window: 1h` with
 a 15-minute schedule).
 
-DNS refusals are retained separately from TCP policy checks. The hydrator checks
-that denied TCP counts cover the DNS refusals for each sandbox and destination;
-otherwise it withholds the score. This is a conservative consistency check, not
-proof that two records came from the same request.
+DNS refusals of names outside the policy are retained separately from TCP
+policy checks and do not change the score. When DNS refusals outnumber denied
+TCP checks for a sandbox and destination, all of that pair's DNS refusals are
+added to `unrepresented_dns_refusals`. For example, two DNS refusals and one
+TCP denial contribute 2. Refusals with a missing destination also contribute
+their full count. This is common: OpenShell answers a refused name without an
+address, so no TCP attempt may follow, and with IPv6 egress a dual-stack client
+is refused once per address family. DNS resolver and mapping-publication
+failures for names the policy allows are recorded as `dns_failure` and are
+not policy denials.
+
+When every agent's score is withheld (for example by unknown policy formats),
+the run logs a warning and the job exits non-zero unless `--allow-unmapped` is
+set. Agents without eligible decisions do not count as withheld.
 
 Policy context records the first observed load for each sandbox/hash/version,
 not every activation or reload. Missing applicable context is marked unknown.
@@ -155,10 +170,12 @@ the example leaves it unset.
   Together with the consumer retaining the last score, a previously clean agent
   can keep 100 after later violations. This is one more reason the weight stays
   at 0 until scores expire.
-- If a sandbox can cause one unreadable or oversized audit line in the shared
-  input (for example through an unbounded request field), it withholds every
-  agent's new score, not only its own, until the file rotates. All agents then
-  keep their previous scores in the reference implementation.
+- An unreadable or oversized audit line is left out of every count, so if it
+  was a denial the affected agent's score is higher than it should be. The
+  run reports the line and exits non-zero rather than withholding scores.
+- DNS refusals of names outside the policy do not lower the score, so an agent
+  that only probes names by DNS, without a TCP attempt, can still score 100.
+  The evidence output keeps the refusal counts.
 - The score is rounded, so a single violation among 200 or more decisions still
   reports 100. The evidence output keeps the exact counts.
 - Rollout behavior (weight 0 has no effect on trust decisions, retained scores,

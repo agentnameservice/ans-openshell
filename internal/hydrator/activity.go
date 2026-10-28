@@ -51,34 +51,35 @@ func newActivityStats() *activityStats {
 }
 
 type activityAggregator struct {
-	agents    AgentMap
 	window    *Window
 	config    ActivityConfig
 	stats     map[string]*activityStats
 	totalUIDs int
 }
 
-func newActivityAggregator(agents AgentMap, window *Window, config ActivityConfig) *activityAggregator {
-	return &activityAggregator{agents: agents, window: window, config: config.withDefaults(), stats: map[string]*activityStats{}}
+func newActivityAggregator(window *Window, config ActivityConfig) *activityAggregator {
+	return &activityAggregator{window: window, config: config.withDefaults(), stats: map[string]*activityStats{}}
 }
 
-func (a *activityAggregator) add(ev Event) {
-	mapping, ok := a.agents.Lookup(ev)
-	if !ok {
-		return
-	}
-	st := a.stats[mapping.AgentID]
+func (a *activityAggregator) agentStats(agentID string) *activityStats {
+	st := a.stats[agentID]
 	if st == nil {
 		st = newActivityStats()
-		a.stats[mapping.AgentID] = st
+		a.stats[agentID] = st
 	}
-	// Policy load records can precede the selected traffic window and arrive out of order.
+	return st
+}
+
+// addPolicy records a policy load record from outside the window; policy
+// load records can precede the selected traffic window and arrive out of order.
+func (a *activityAggregator) addPolicy(mapping AgentMapping, ev Event) {
+	a.agentStats(mapping.AgentID).addPolicy(ev, a.window)
+}
+
+func (a *activityAggregator) add(mapping AgentMapping, ev Event) {
+	st := a.agentStats(mapping.AgentID)
 	if ev.ClassUID == ClassDeviceConfigChange {
 		st.addPolicy(ev, a.window)
-	}
-	ts, hasTime := ev.Timestamp()
-	if a.window != nil && (!hasTime || !a.window.Contains(ts)) {
-		return
 	}
 	st.active = true
 	if !a.acceptUID(st, ev.Metadata.UID) {
@@ -251,15 +252,15 @@ func (s *activityStats) recordDecisionTime(ev Event) {
 	}
 }
 
+// recordDenialCoverage feeds the coverage diagnostic only; the denial itself is
+// already counted, so a full or oversized key never withholds the score.
 func (s *activityStats) recordDenialCoverage(ev Event, dns bool) {
 	key := destinationKey{sandbox: activitySandbox(ev), destination: ev.Destination()}
 	if len(key.sandbox) > maxActivityText || len(key.destination) > maxActivityFieldBytes {
-		s.unavailable = activityIncomplete
 		s.diagnostics["denial_coverage_limit"]++
 		return
 	}
 	if _, known := s.denialCoverage[key]; !known && len(s.denialCoverage) >= maxActivityDetails {
-		s.unavailable = activityIncomplete
 		s.diagnostics["denial_coverage_limit"]++
 		return
 	}
@@ -347,33 +348,33 @@ func (a *activityAggregator) evidence(window Window, input auditInputHealth) []A
 	return out
 }
 
-// finalState returns the unavailable reason and diagnostics after the
-// end-of-input checks, without changing the accumulated state. The first
-// recorded reason wins, so a later check never hides an earlier one.
-func (s *activityStats) finalState(input auditInputHealth) (string, map[string]int) {
-	unavailable := s.unavailable
+// finalDiagnostics returns the diagnostics after the end-of-input checks,
+// without changing the accumulated state. None of these checks withholds the
+// score.
+func (s *activityStats) finalDiagnostics(input auditInputHealth) map[string]int {
 	diagnostics := maps.Clone(s.diagnostics)
 	for key, counts := range s.denialCoverage {
-		// This is only an aggregate coverage guard, never event pairing or unique-request reconstruction.
+		// Aggregate coverage diagnostic only. OpenShell answers an ineligible name
+		// with REFUSED, so a refusal is often not followed by a TCP attempt, and
+		// dual-stack clients are refused once per address family.
 		if counts.dns > counts.tcp || counts.dns > 0 && key.destination == "" {
-			unavailable = cmp.Or(unavailable, activityIncomplete)
 			diagnostics["unrepresented_dns_refusals"] += counts.dns
 		}
 	}
-	// An unreadable audit line cannot be attributed to an agent, so it withholds every new score.
+	// An unreadable audit line cannot be attributed to an agent; it is reported
+	// once per run and recorded in every agent's diagnostics without withholding.
 	if input.unreadable > 0 {
-		unavailable = cmp.Or(unavailable, activityUnreadableRecords)
 		diagnostics[activityUnreadableRecords] = input.unreadable
 	}
 	// A final line without a newline is still being written; the next run reads it whole.
 	if input.truncatedTail > 0 {
 		diagnostics["truncated_final_line"] = input.truncatedTail
 	}
-	return unavailable, diagnostics
+	return diagnostics
 }
 
 func (s *activityStats) evidence(id string, window Window, minimum int, input auditInputHealth) ActivityEvidence {
-	unavailable, diagnostics := s.finalState(input)
+	diagnostics := s.finalDiagnostics(input)
 	policies := make([]PolicyContext, 0, len(s.policies))
 	for _, p := range s.policies {
 		policies = append(policies, p)
@@ -388,7 +389,7 @@ func (s *activityStats) evidence(id string, window Window, minimum int, input au
 	slices.SortFunc(findings, func(a, b ActivityFinding) int {
 		return cmp.Or(cmp.Compare(a.Origin, b.Origin), cmp.Compare(a.Middleware, b.Middleware), cmp.Compare(a.Type, b.Type), cmp.Compare(a.Severity, b.Severity))
 	})
-	score, reason, sample := assessActivity(s.measurements, minimum, unavailable)
+	score, reason, sample := assessActivity(s.measurements, minimum, s.unavailable)
 	ev := ActivityEvidence{
 		SchemaVersion:  1,
 		AgentID:        id,

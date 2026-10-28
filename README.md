@@ -80,7 +80,8 @@ traffic, so it is not the input.
 
 `--dry-run` prints the import request instead of posting it; `--window-start` and
 `--window-end` (RFC 3339) pin the observation window. The job exits non-zero when events were
-parsed but none mapped to a configured agent, which usually means the sandbox mapping drifted;
+parsed but none mapped to a configured agent, which usually means the sandbox mapping drifted,
+or when the optional activity output is degraded (see `docs/hydrator-activity.md`);
 `--allow-unmapped` accepts that. The Trust Index admin key comes from
 `trust_index.admin_key_file` or the `ANS_TRUST_INDEX_ADMIN_KEY` environment variable.
 

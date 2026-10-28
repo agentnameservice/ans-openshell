@@ -30,14 +30,14 @@ const (
 const maxActivityFieldBytes = 1024
 
 const (
-	networkActivityOpen    = 1
-	networkActivityFail    = 4
-	networkActivityTraffic = 5
-	policyActivityOther    = 99
-	observedActionID       = 3
-	middlewareTokenCount   = 2
-	minimumL7Tokens        = 4
-	minimumJSONRPCTokens   = 3
+	networkActivityOpen   = 1
+	networkActivityFail   = 4
+	networkActivityRefuse = 5
+	policyActivityOther   = 99
+	observedActionID      = 3
+	middlewareTokenCount  = 2
+	minimumL7Tokens       = 4
+	minimumJSONRPCTokens  = 3
 )
 
 const (
@@ -100,7 +100,7 @@ func classifyPolicyRecord(record activityRecord) classifiedActivity {
 		classifyWebSocketNotice,
 		classifySession,
 		classifyConnectionFailure,
-		classifyDNSTraffic,
+		classifyDNSRefusal,
 		classifyL7Decision,
 	}
 	for _, rule := range rules {
@@ -251,15 +251,28 @@ func classifyConnectionFailure(record activityRecord) (classifiedActivity, bool)
 	return classifiedActivity{Diagnostic: "connection_failure"}, true
 }
 
-func classifyDNSTraffic(record activityRecord) (classifiedActivity, bool) {
-	if record.ClassUID != ClassNetworkActivity || record.ActivityID != networkActivityTraffic {
+func classifyDNSRefusal(record activityRecord) (classifiedActivity, bool) {
+	if record.ClassUID != ClassNetworkActivity || record.ActivityID != networkActivityRefuse {
 		return classifiedActivity{}, false
 	}
 	if record.StatusDetail == "policy_dns_ineligible" && strings.HasPrefix(record.Message, "Policy DNS refused ") &&
 		record.deniedEnum() && decisionEnumsMatch(record.Event, decisionDenied) {
 		return classifiedActivity{Diagnostic: activityDNSRefused}, true
 	}
+	if policyDNSFailure(record.StatusDetail) && strings.HasPrefix(record.Message, "Policy DNS ") {
+		return classifiedActivity{Diagnostic: "dns_failure"}, true
+	}
 	return classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}, true
+}
+
+// policyDNSFailure reports the resolver and publication failures OpenShell
+// emits for policy-eligible names as Refuse/Denied records; they are not
+// policy denials.
+func policyDNSFailure(detail string) bool {
+	return detail == "policy_dns_no_valid_address" ||
+		strings.HasPrefix(detail, "policy_dns_upstream_") ||
+		strings.HasPrefix(detail, "policy_dns_publication_") ||
+		strings.HasPrefix(detail, "policy_dns_observation_")
 }
 
 func activityFailed(unmapped map[string]json.RawMessage) (bool, bool) {

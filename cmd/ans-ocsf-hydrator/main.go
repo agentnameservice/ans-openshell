@@ -71,6 +71,14 @@ var (
 	errNoSignals         = errors.New("signals: every signal is disabled; nothing would be posted (select --evidence-output for local evidence only)")
 )
 
+// A degraded run has already posted what it could; it still fails so the
+// scheduler surfaces input the corrected path could not use, or a run that
+// left every agent's earlier activity score in place.
+var (
+	errUnreadableAudit  = errors.New("input had audit records that could not be read; activity evidence omits them (set --allow-unmapped to accept this)")
+	errActivityWithheld = errors.New("every agent's activity score was withheld; the Trust Index keeps the previous scores (set --allow-unmapped to accept this)")
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ans-ocsf-hydrator:", err)
@@ -84,7 +92,7 @@ func run() error {
 	flag.StringVar(&f.input, "input", "-", "OCSF JSONL file, or - for stdin")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the import request instead of posting it")
 	flag.StringVar(&f.evidenceOutput, "evidence-output", "", "write corrected structured evidence as JSONL to a new file, or - for stdout (stdout cannot be combined with --dry-run)")
-	flag.BoolVar(&f.allowUnmapped, "allow-unmapped", false, "exit 0 when the input yields no OCSF events or none of them map to an agent")
+	flag.BoolVar(&f.allowUnmapped, "allow-unmapped", false, "exit 0 when the input yields no OCSF events, none of them map to an agent, or the activity output is degraded")
 	flag.StringVar(&f.windowStart, "window-start", "", "RFC 3339 start of the observation window (default: first event)")
 	flag.StringVar(&f.windowEnd, "window-end", "", "RFC 3339 end of the observation window (default: last event)")
 	flag.DurationVar(&f.windowLast, "window-last", 0, "aggregate only the trailing duration before now, e.g. 15m; an alternative to --window-start/--window-end")
@@ -139,7 +147,8 @@ func hydrate(ctx context.Context, cfg fileConfig, f flags, logger *slog.Logger) 
 	if closeErr := closeEvidence(); closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("close evidence output: %w", closeErr))
 	}
-	logReport(ctx, logger, cfg.Agents, report, err)
+	legacy := opts.Signals.EmitPolicyViolationRate || opts.Signals.EmitProtocolAdherence
+	logReport(ctx, logger, cfg.Agents, report, legacy, err)
 	if err != nil {
 		return err
 	}
@@ -147,7 +156,33 @@ func hydrate(ctx context.Context, cfg fileConfig, f flags, logger *slog.Logger) 
 		logger.ErrorContext(ctx, "hydration rejected", "err", err)
 		return err
 	}
+	if err := degradedRunError(report, opts.Signals.EmitActivity, f.allowUnmapped); err != nil {
+		logger.ErrorContext(ctx, "hydration degraded", "err", err)
+		return err
+	}
 	return nil
+}
+
+// degradedRunError decides whether a run whose activity output was degraded
+// is a failure: unreadable audit records in the input, or a numeric activity
+// score withheld from every evaluated agent. Quiet agents without eligible
+// decisions do not count as withheld.
+func degradedRunError(report hydrator.Report, emitActivity, allowDegraded bool) error {
+	if allowDegraded {
+		return nil
+	}
+	if report.UnreadableAuditRecords > 0 {
+		return errUnreadableAudit
+	}
+	if !emitActivity || len(report.Activity) == 0 {
+		return nil
+	}
+	for _, evidence := range report.Activity {
+		if !evidence.Degraded() {
+			return nil
+		}
+	}
+	return errActivityWithheld
 }
 
 // emptyRunError decides whether a run that posted nothing is a failure. A
@@ -339,7 +374,10 @@ func openEvidence(path string, dryRun bool) (io.Writer, func() error, error) {
 	return f, f.Close, nil
 }
 
-func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.AgentMapping, r hydrator.Report, runErr error) {
+// logReport logs the run and agent summaries. The legacy denied count is
+// logged only when a legacy signal is emitted; the activity summary carries
+// the corrected counts.
+func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.AgentMapping, r hydrator.Report, legacy bool, runErr error) {
 	if runErr != nil {
 		logger.ErrorContext(ctx, "hydration failed", "err", runErr)
 	}
@@ -351,8 +389,11 @@ func logReport(ctx context.Context, logger *slog.Logger, configured []hydrator.A
 	seen := make(map[string]bool, len(r.Agents))
 	for _, a := range r.Agents {
 		seen[a.AgentID] = true
-		logger.InfoContext(ctx, "agent summary", "agent_id", a.AgentID, "ans_name", a.AnsName,
-			"events", a.Events, "denied", a.Denied, "observations", a.Observations)
+		attrs := []any{"agent_id", a.AgentID, "ans_name", a.AnsName, "events", a.Events}
+		if legacy {
+			attrs = append(attrs, "denied", a.Denied)
+		}
+		logger.InfoContext(ctx, "agent summary", append(attrs, "observations", a.Observations)...)
 	}
 	for _, m := range configured {
 		if !seen[m.AgentID] {

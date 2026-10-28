@@ -252,36 +252,42 @@ func (r *Reader) countUndecodable(line []byte) {
 }
 
 // looksLikeAudit reports whether decodeLine would have tried to parse the line
-// as an audit record: a JSON object, or a stderr marker followed by an object
-// or by nothing at all.
+// as an audit record: a JSON object, or the supervisor's OCSF-JSON marker
+// followed by an object or by nothing at all.
 func looksLikeAudit(line []byte) bool {
+	payload, ok := auditPayload(line)
+	return ok && (len(payload) == 0 || payload[0] == '{')
+}
+
+// auditPayload returns the JSON payload of an audit line: a bare JSONL object,
+// or the object after the supervisor's "{ts} OCSF-JSON " framing, which a log
+// collector may prefix with its own timestamp. The marker must be a whole
+// token preceded only by timestamp text; shorthand lines carry a bracketed
+// severity tag before any request-derived text, so a copy of a record inside
+// a shorthand line never looks like the record.
+func auditPayload(line []byte) ([]byte, bool) {
 	trimmed := bytes.TrimSpace(line)
 	if bytes.HasPrefix(trimmed, []byte("{")) {
-		return true
+		return trimmed, true
 	}
-	if _, payload, found := bytes.Cut(trimmed, []byte(ocsfJSONMarker)); found {
-		payload = bytes.TrimSpace(payload)
-		return len(payload) == 0 || payload[0] == '{'
+	marker := bytes.TrimSpace([]byte(ocsfJSONMarker))
+	idx := bytes.Index(trimmed, marker)
+	if idx < 0 || (idx > 0 && trimmed[idx-1] != ' ') || bytes.IndexByte(trimmed[:idx], '[') >= 0 {
+		return nil, false
 	}
-	return bytes.HasSuffix(trimmed, bytes.TrimSpace([]byte(ocsfJSONMarker)))
+	payload := trimmed[idx+len(marker):]
+	if len(payload) > 0 && payload[0] != ' ' {
+		return nil, false
+	}
+	return bytes.TrimSpace(payload), true
 }
 
 // decodeLine extracts the JSON payload from a JSONL or stderr line and
 // decodes it. It reports false for blank, shorthand and malformed lines.
 func decodeLine(line []byte) (Event, bool) {
-	payload := bytes.TrimSpace(line)
-	if len(payload) == 0 {
+	payload, ok := auditPayload(line)
+	if !ok || len(payload) == 0 || payload[0] != '{' {
 		return Event{}, false
-	}
-	if payload[0] != '{' {
-		idx := bytes.Index(payload, []byte(ocsfJSONMarker))
-		if idx < 0 {
-			return Event{}, false
-		}
-		payload = bytes.TrimSpace(payload[idx+len(ocsfJSONMarker):])
-		if len(payload) == 0 || payload[0] != '{' {
-			return Event{}, false
-		}
 	}
 	var ev Event
 	if err := json.Unmarshal(payload, &ev); err != nil {

@@ -130,6 +130,11 @@ func TestClassifyActivityRouting(t *testing.T) {
 		{"unknown DNS event is incomplete", Event{ClassUID: 4001, ActivityID: 5, ActionID: 1, DispositionID: 1, Message: "DNS lookup"}, classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}},
 		{"missing DNS decision", Event{ClassUID: 4001, ActivityID: 5, Message: "Policy DNS refused a name that is not eligible in the active policy", StatusDetail: "policy_dns_ineligible"}, classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}},
 		{"DNS gateway unavailable", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, Message: "Policy DNS refused a reserved host-gateway alias because no trusted gateway is configured", StatusDetail: "policy_dns_trusted_gateway_unavailable"}, classifiedActivity{Diagnostic: "operational_failure"}},
+		{"DNS upstream failure", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, StatusID: 2, Message: "Policy DNS trusted resolver query failed", StatusDetail: "policy_dns_upstream_nxdomain"}, classifiedActivity{Diagnostic: "dns_failure"}},
+		{"DNS no valid address", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, StatusID: 2, Message: "Policy DNS rejected every trusted resolver address", StatusDetail: "policy_dns_no_valid_address"}, classifiedActivity{Diagnostic: "dns_failure"}},
+		{"DNS publication failure", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, StatusID: 2, Message: "Policy DNS resolved-endpoint mapping publication failed", StatusDetail: "policy_dns_publication_pool_exhausted"}, classifiedActivity{Diagnostic: "dns_failure"}},
+		{"DNS observation budget", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, StatusID: 2, Message: "Policy DNS resolved-endpoint mapping publication failed", StatusDetail: "policy_dns_observation_budget_exhausted"}, classifiedActivity{Diagnostic: "dns_failure"}},
+		{"DNS failure detail without policy DNS message", Event{ClassUID: 4001, ActivityID: 5, ActionID: 2, DispositionID: 2, StatusID: 2, Message: "resolver query failed", StatusDetail: "policy_dns_upstream_timeout"}, classifiedActivity{Diagnostic: "unknown_dns_decision", Incomplete: true}},
 		{"proxy connection failure", Event{ClassUID: 4001, ActivityID: 4, StatusID: 2, Message: "Proxy connection error: connection refused"}, classifiedActivity{Diagnostic: "connection_failure"}},
 		{"transparent connection failure", Event{ClassUID: 4001, ActivityID: 4, StatusID: 2, Message: "Transparent TCP connection error: timeout"}, classifiedActivity{Diagnostic: "connection_failure"}},
 		{"network failure without message", Event{ClassUID: 4001, ActivityID: 4, StatusID: 2}, classifiedActivity{Diagnostic: "connection_failure"}},
@@ -195,16 +200,18 @@ func TestClassifyActivityRouting(t *testing.T) {
 // toward the classes, activities, statuses and message families the rules read.
 func fuzzActivityEvent(class, activity, action, disposition, status, family, metadata uint8, suffix string) Event {
 	classes := [...]int{ClassHTTPActivity, ClassNetworkActivity, ClassProcessActivity, ClassDetectionFinding, 0}
-	activities := [...]int{0, networkActivityOpen, 2, 3, networkActivityFail, networkActivityTraffic, policyActivityOther}
+	activities := [...]int{0, networkActivityOpen, 2, 3, networkActivityFail, networkActivityRefuse, policyActivityOther}
 	enums := [...]int{0, 1, deniedID, observedActionID, policyActivityOther}
 	statuses := [...]string{"", "credential_endpoint_mismatch", "request_authority_mismatch", "credential_unavailable",
 		"assembly_capacity_exhausted", "policy_dns_trusted_gateway_unavailable", "policy_dns_ineligible",
-		"transparent_tcp_allowed", "transparent_tcp_policy_denied", "transparent_tcp_mapping_expired"}
+		"transparent_tcp_allowed", "transparent_tcp_policy_denied", "transparent_tcp_mapping_expired",
+		"policy_dns_upstream_nxdomain", "policy_dns_no_valid_address", "policy_dns_publication_pool_exhausted",
+		"policy_dns_observation_budget_exhausted"}
 	families := [...]string{"", "L7_REQUEST ", "GRAPHQL_L7_REQUEST ", "JSONRPC_L7_REQUEST ", "JSONRPC_L7_REQUEST decision=",
 		"L7_REQUEST_TRANSFORMED ", "WEBSOCKET_L7_REQUEST ", "CONNECT ", "CONNECT_L7 ", "CONNECT denied ", "Transparent TCP ",
 		"Transparent TCP denied ", "MIDDLEWARE ", "WEBSOCKET_MIDDLEWARE ", "WEBSOCKET_MIDDLEWARE_COVERAGE ",
 		"WEBSOCKET_CREDENTIAL_REWRITE ", "HTTP_REQUEST ", "Policy DNS refused ", "Supervisor session established",
-		"Proxy connection error: "}
+		"Proxy connection error: ", "Policy DNS trusted resolver query failed"}
 	metadatas := [...]string{"", `{"coverage_state":"binding_not_selected"}`, `{"coverage_state":""}`, `{"failed":true}`,
 		`{"failed":"maybe"}`, `{"middleware":"guard","count":1}`, `not json`}
 	return Event{
@@ -251,6 +258,7 @@ func FuzzClassifyActivityKeepsStatedDecisions(f *testing.F) {
 	f.Add(uint8(0), uint8(6), uint8(2), uint8(2), uint8(3), uint8(1), uint8(0), "deny POST example.com:443/upload reason=rule")
 	f.Add(uint8(1), uint8(3), uint8(0), uint8(0), uint8(0), uint8(11), uint8(0), "example.com:443")
 	f.Add(uint8(2), uint8(1), uint8(0), uint8(0), uint8(7), uint8(10), uint8(0), "mapping_id=placeholder")
+	f.Add(uint8(1), uint8(5), uint8(2), uint8(2), uint8(10), uint8(20), uint8(0), "")
 	f.Fuzz(func(t *testing.T, class, activity, action, disposition, status, family, metadata uint8, suffix string) {
 		ev := fuzzActivityEvent(class, activity, action, disposition, status, family, metadata, suffix)
 		if ev.ClassUID == ClassDetectionFinding {

@@ -90,31 +90,50 @@ func (s *agentStats) rate() float64 {
 	return float64(s.denied) / float64(s.total)
 }
 
-// aggregator attributes events to agents and tracks the input window.
-type aggregator struct {
-	// skipLegacyStats counts attributed events without accumulating the legacy
-	// observation payload, when no legacy signal will be emitted.
-	skipLegacyStats bool
-	agents          AgentMap
-	window          *Window
-	earliest        time.Time
-	latest          time.Time
-	stats           map[string]*agentStats
-	unmapped        int
-	noContainer     int
-	outOfWindow     int
-	attributed      int
+// statsConsumer receives every event that resolved to a configured agent and
+// fell inside the window.
+type statsConsumer interface {
+	add(mapping AgentMapping, ev Event)
 }
 
-func newAggregator(agents AgentMap, window *Window) *aggregator {
-	return &aggregator{agents: agents, window: window, stats: map[string]*agentStats{}}
+// policyObserver is an optional statsConsumer extension for attributed policy
+// load records outside the window, since a policy loaded before the window
+// still governs the decisions inside it.
+type policyObserver interface {
+	addPolicy(mapping AgentMapping, ev Event)
 }
 
-func (a *aggregator) add(ev Event) {
+// attributedAgent is a configured agent with at least one attributed event.
+type attributedAgent struct {
+	mapping AgentMapping
+	events  int
+}
+
+// attributor attributes events to agents, tracks the input window and fans
+// each attributed event out to the registered stats consumers.
+type attributor struct {
+	agents      AgentMap
+	window      *Window
+	consumers   []statsConsumer
+	earliest    time.Time
+	latest      time.Time
+	seen        map[string]*attributedAgent
+	unmapped    int
+	noContainer int
+	outOfWindow int
+	attributed  int
+}
+
+func newAttributor(agents AgentMap, window *Window, consumers ...statsConsumer) *attributor {
+	return &attributor{agents: agents, window: window, consumers: consumers, seen: map[string]*attributedAgent{}}
+}
+
+func (a *attributor) add(ev Event) {
 	ts, hasTime := ev.Timestamp()
 	if a.window != nil {
 		if !hasTime || !a.window.Contains(ts) {
 			a.outOfWindow++
+			a.observeOutOfWindowPolicy(ev)
 			return
 		}
 	} else if hasTime {
@@ -129,19 +148,56 @@ func (a *aggregator) add(ev Event) {
 		return
 	}
 	a.attributed++
-	st, seen := a.stats[mapping.AgentID]
+	agent, seen := a.seen[mapping.AgentID]
 	if !seen {
-		st = newAgentStats(mapping)
-		a.stats[mapping.AgentID] = st
+		agent = &attributedAgent{mapping: mapping}
+		a.seen[mapping.AgentID] = agent
 	}
-	if a.skipLegacyStats {
-		st.events++
-	} else {
-		st.add(ev)
+	agent.events++
+	for _, consumer := range a.consumers {
+		consumer.add(mapping, ev)
 	}
 }
 
-func (a *aggregator) extend(ts time.Time) {
+// observeOutOfWindowPolicy forwards an attributed out-of-window policy load
+// record to the consumers that track policy context. It does not change the
+// attribution counters, so the record still counts only as out of window.
+func (a *attributor) observeOutOfWindowPolicy(ev Event) {
+	if ev.ClassUID != ClassDeviceConfigChange {
+		return
+	}
+	mapping, ok := a.agents.Lookup(ev)
+	if !ok {
+		return
+	}
+	for _, consumer := range a.consumers {
+		if observer, tracksPolicy := consumer.(policyObserver); tracksPolicy {
+			observer.addPolicy(mapping, ev)
+		}
+	}
+}
+
+// legacyAggregator accumulates the payload of the legacy policy-violation-rate
+// and protocol-adherence signals. It is registered only when one of them is
+// emitted.
+type legacyAggregator struct {
+	stats map[string]*agentStats
+}
+
+func newLegacyAggregator() *legacyAggregator {
+	return &legacyAggregator{stats: map[string]*agentStats{}}
+}
+
+func (l *legacyAggregator) add(mapping AgentMapping, ev Event) {
+	st, seen := l.stats[mapping.AgentID]
+	if !seen {
+		st = newAgentStats(mapping)
+		l.stats[mapping.AgentID] = st
+	}
+	st.add(ev)
+}
+
+func (a *attributor) extend(ts time.Time) {
 	if a.earliest.IsZero() || ts.Before(a.earliest) {
 		a.earliest = ts
 	}
@@ -152,7 +208,7 @@ func (a *aggregator) extend(ts time.Time) {
 
 // resolveWindow returns the explicit window, else the span of event times,
 // else a window collapsed onto now when no event carried a timestamp.
-func (a *aggregator) resolveWindow(now time.Time) Window {
+func (a *attributor) resolveWindow(now time.Time) Window {
 	if a.window != nil {
 		return *a.window
 	}

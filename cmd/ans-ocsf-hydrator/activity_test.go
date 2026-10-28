@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -280,6 +281,82 @@ func TestHydrateActivityPosting(t *testing.T) {
 	}
 }
 
+func TestHydrateDegradedRun(t *testing.T) {
+	t.Parallel()
+	const (
+		allowed = `{"class_uid":4002,"activity_id":99,"action_id":1,"disposition_id":1,"time":1791996120000,"container":{"name":"probe"},"message":"L7_REQUEST allow GET example.com:443/test reason=rule"}`
+		unknown = `{"class_uid":4002,"activity_id":99,"action_id":1,"disposition_id":1,"time":1791996120000,"container":{"name":"probe"},"message":"FUTURE_L7_FORMAT permitted=true"}`
+		broken  = "OCSF-JSON {broken"
+	)
+	tests := []struct {
+		name       string
+		payload    string
+		allow      bool
+		wantPosted int32
+		wantErr    error
+	}{
+		{name: "unreadable line still posts the score", payload: allowed + "\n" + broken + "\n", wantPosted: 1, wantErr: errUnreadableAudit},
+		{name: "unreadable line accepted", payload: allowed + "\n" + broken + "\n", allow: true, wantPosted: 1},
+		{name: "every score withheld", payload: unknown + "\n", wantErr: errActivityWithheld},
+		{name: "every score withheld accepted", payload: unknown + "\n", allow: true},
+		{name: "clean run", payload: allowed + "\n", wantPosted: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var posted atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				posted.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			var cfg fileConfig
+			data := "provenance:\n  aim_id: ans://v1.0.0.collector.example.com\nagents:\n  - agent_id: probe\n    sandbox_names: [probe]\nsignals:\n  policy_violation_rate: \"\"\n  protocol_adherence: \"\"\n  activity: openshell.behavior.activity\n"
+			if err := config.Parse([]byte(data), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			cfg.TrustIndex.BaseURL = server.URL
+			input := filepath.Join(t.TempDir(), "input.jsonl")
+			if err := os.WriteFile(input, []byte(tt.payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := hydrate(context.Background(), cfg, flags{input: input, allowUnmapped: tt.allow}, slog.New(slog.DiscardHandler))
+			if got := posted.Load(); got != tt.wantPosted {
+				t.Fatalf("posted %d requests, want %d", got, tt.wantPosted)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("hydrate() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLogReportLegacyDenied(t *testing.T) {
+	t.Parallel()
+	for _, legacy := range []bool{false, true} {
+		var output bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&output, nil))
+		report := hydrator.Report{Agents: []hydrator.AgentSummary{{AgentID: "probe", Events: 3, Denied: 1, Observations: 1}}}
+		logReport(context.Background(), logger, nil, report, legacy, nil)
+		var agentLine map[string]json.RawMessage
+		for line := range strings.SplitSeq(strings.TrimSpace(output.String()), "\n") {
+			var record map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatal(err)
+			}
+			if string(record["msg"]) == `"agent summary"` {
+				agentLine = record
+			}
+		}
+		if agentLine == nil {
+			t.Fatalf("legacy=%v: agent summary missing: %s", legacy, output.Bytes())
+		}
+		if _, logged := agentLine["denied"]; logged != legacy {
+			t.Fatalf("legacy=%v: denied logged=%v: %s", legacy, logged, output.Bytes())
+		}
+	}
+}
+
 func TestOpenEvidence(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -365,7 +442,6 @@ func TestLogActivity(t *testing.T) {
 		{name: "sample minimum", unavailable: "insufficient_sample", level: "INFO"},
 		{name: "deduplication saturated", unavailable: "dedup_saturated", level: "WARN"},
 		{name: "unknown policy format", unavailable: "interpretation_incomplete", level: "WARN"},
-		{name: "malformed audit feed", unavailable: "unreadable_audit_records", level: "WARN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

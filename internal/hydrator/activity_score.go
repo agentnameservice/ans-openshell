@@ -9,10 +9,13 @@ import (
 const (
 	activityIncomplete          = "interpretation_incomplete"
 	activityDedupSaturated      = "dedup_saturated"
-	activityUnreadableRecords   = "unreadable_audit_records"
 	activityInsufficientSample  = "insufficient_sample"
 	activityNoEligibleDecisions = "no_eligible_decisions"
 )
+
+// activityUnreadableRecords is the diagnostic recorded in every agent's
+// evidence when audit-shaped lines in the input could not be read.
+const activityUnreadableRecords = "unreadable_audit_records"
 
 // activityDNSRefused is the diagnostic that feeds the DNS-to-TCP denial
 // coverage check, so producer and consumer must agree on it.

@@ -164,28 +164,23 @@ func TestActivityOnlyDoesNotAccumulateLegacyPayload(t *testing.T) {
 				opts.Signals = DefaultSignalConfig()
 				opts.Signals.EmitActivity = true
 			}
-			agg, activity := newAggregators(opts)
-			if activity == nil {
+			stats := newRunStats(opts)
+			if stats.activity == nil {
 				t.Fatal("activity aggregator not built")
 			}
-			consumers := eventConsumers(agg, activity)
 			for _, uid := range []string{"1", "2", "3"} {
-				for _, consumer := range consumers {
-					consumer.add(Event{ClassUID: 4001, ActivityID: 1, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, DstEndpoint: &Endpoint{Domain: uid + ".example.com"}, Message: "CONNECT allowed example.com:443"})
-				}
+				stats.attributor.add(Event{ClassUID: 4001, ActivityID: 1, ActionID: 1, DispositionID: 1, Time: 1, Container: &Container{UID: sandboxAUID}, Metadata: Metadata{UID: uid}, DstEndpoint: &Endpoint{Domain: uid + ".example.com"}, Message: "CONNECT allowed example.com:443"})
 			}
-			st := agg.stats["agent-a"]
-			if st.events != 3 {
+			if stats.attributor.seen["agent-a"].events != 3 {
 				t.Fatal("summary attribution lost")
 			}
-			want := 0
-			if tc.legacy {
-				want = 3
+			if (stats.legacy != nil) != tc.legacy {
+				t.Fatalf("legacy aggregator registered=%v, want %v", stats.legacy != nil, tc.legacy)
 			}
-			if len(st.destinations) != want {
-				t.Fatalf("legacy destinations=%d want %d", len(st.destinations), want)
+			if tc.legacy && len(stats.legacy.stats["agent-a"].destinations) != 3 {
+				t.Fatalf("legacy destinations=%d want 3", len(stats.legacy.stats["agent-a"].destinations))
 			}
-			if got := activity.stats["agent-a"].measurements.Connections.Allowed; got != 3 {
+			if got := stats.activity.stats["agent-a"].measurements.Connections.Allowed; got != 3 {
 				t.Fatalf("activity connections allowed=%d, want 3", got)
 			}
 		})
@@ -194,16 +189,42 @@ func TestActivityOnlyDoesNotAccumulateLegacyPayload(t *testing.T) {
 
 func TestActivityAggregatorOnlyWhenRequested(t *testing.T) {
 	t.Parallel()
-	agg, activity := newAggregators(Options{Agents: sampleAgents(t), Signals: DefaultSignalConfig()})
-	if activity != nil || agg.skipLegacyStats {
+	stats := newRunStats(Options{Agents: sampleAgents(t), Signals: DefaultSignalConfig()})
+	if stats.activity != nil || stats.legacy == nil {
 		t.Fatal("legacy-only run built the activity path")
 	}
-	if consumers := eventConsumers(agg, activity); len(consumers) != 1 {
+	if consumers := stats.attributor.consumers; len(consumers) != 1 {
 		t.Fatalf("consumers=%d, want the legacy aggregator only", len(consumers))
 	}
-	_, activity = newAggregators(Options{Agents: sampleAgents(t), Evidence: &bytes.Buffer{}})
-	if activity == nil {
-		t.Fatal("evidence-only run did not build the activity path")
+	stats = newRunStats(Options{Agents: sampleAgents(t), Evidence: &bytes.Buffer{}})
+	if stats.activity == nil || stats.legacy != nil {
+		t.Fatal("evidence-only run did not build only the activity path")
+	}
+}
+
+func TestActivityPolicyBeforeWindow(t *testing.T) {
+	t.Parallel()
+	window := Window{Start: time.UnixMilli(sampleBaseMs).UTC(), End: time.UnixMilli(sampleBaseMs + 60_000).UTC()}
+	opts := activityOptions(t)
+	opts.Window = &window
+	policy := func(uid string, offsetMs int64) string {
+		return jsonLine(t, map[string]any{"class_uid": ClassDeviceConfigChange, "activity_id": 1, "time": sampleBaseMs + offsetMs, "container": map[string]any{"uid": sandboxAUID}, "metadata": map[string]any{"uid": uid}, "unmapped": map[string]any{"policy_hash": "before" + uid, "version": 1}})
+	}
+	lines := []string{
+		policy("p1", -1000),
+		policy("p2", 120_000),
+		jsonLine(t, map[string]any{"class_uid": ClassDeviceConfigChange, "activity_id": 1, "time": sampleBaseMs - 1000, "container": map[string]any{"uid": "unmapped-sandbox"}, "unmapped": map[string]any{"policy_hash": "unmapped", "version": 1}}),
+		activityInput(t, "a1", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1),
+	}
+	report, err := Run(t.Context(), strings.NewReader(strings.Join(lines, "\n")), &fakeSink{}, opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OutOfWindow != 3 || report.Attributed != 1 || report.Unmapped != 0 {
+		t.Fatalf("outOfWindow/attributed/unmapped=%d/%d/%d, want 3/1/0", report.OutOfWindow, report.Attributed, report.Unmapped)
+	}
+	if len(report.Activity) != 1 || len(report.Activity[0].Policies) != 1 || report.Activity[0].Policies[0].Hash != "beforep1" {
+		t.Fatalf("pre-window policy context=%+v, want only the policy loaded before the window", report.Activity)
 	}
 }
 
