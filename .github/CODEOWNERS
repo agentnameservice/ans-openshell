@@ -1,2 +1,2 @@
-# Repository Maintainers; see /MAINTAINERS.md.
-* @agentnameservice/ans-openshell-maintainers
+# Review routing; merge permissions are managed separately.
+* @agentnameservice/ans-openshell-maintainers @agentnameservice/tsc-owners
