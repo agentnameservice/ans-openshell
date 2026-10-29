@@ -45,6 +45,13 @@ spec:
                 - --window-last
                 - {{ . | quote }}
 {{- end }}
+{{- with .Values.hydrator.evidenceOutput }}
+{{- if ne . "-" }}
+{{- fail "hydrator.evidenceOutput must be empty or \"-\": the CronJob reruns every schedule and the hydrator refuses to overwrite an existing evidence file" }}
+{{- end }}
+                - --evidence-output
+                - {{ . | quote }}
+{{- end }}
 {{- if .Values.hydrator.adminKeySecret }}
               envFrom:
                 - secretRef: {name: {{ .Values.hydrator.adminKeySecret }}}
