@@ -5,7 +5,7 @@ ANS identity for agents running in [NVIDIA OpenShell](https://github.com/NVIDIA/
 An agent inside an OpenShell sandbox never sees its own credentials: the supervisor outside the
 sandbox injects them. This repository extends that model to agent identity. A supervisor
 middleware signs every allowed outbound request as the sandbox's registered
-[Agent Name Service](https://github.com/agentnameservice/ans-registry) (ANS) agent using
+[Agent Name Service](https://github.com/agentnameservice/ans-spec) (ANS) agent using
 ANS-6 Method B (a DPoP proof plus the agent's transparency-log receipt and status token), so any
 callee that implements ANS-6 can verify who is calling without the sandbox ever holding the
 identity key. A gateway interceptor vets destination hosts against ANS registration before a
