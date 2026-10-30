@@ -7,9 +7,16 @@ import (
 	"time"
 )
 
+// newLegacyAttributor wires an attributor to a legacy aggregator, the shape of
+// a run that emits only the legacy signals.
+func newLegacyAttributor(agents AgentMap, window *Window) (*attributor, *legacyAggregator) {
+	legacy := newLegacyAggregator()
+	return newAttributor(agents, window, legacy), legacy
+}
+
 func TestAggregatorNetworkMath(t *testing.T) {
 	t.Parallel()
-	agg := newAggregator(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), nil)
+	agg, legacy := newLegacyAttributor(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), nil)
 	events := []Event{
 		netEvent(ClassNetworkActivity, "sb", false, "", "api.github.com", "", 1000),
 		netEvent(ClassNetworkActivity, "sb", true, "transparent_tcp_policy_denied", "github.com", "198.18.0.2", 2000),
@@ -24,9 +31,12 @@ func TestAggregatorNetworkMath(t *testing.T) {
 	for _, ev := range events {
 		agg.add(ev)
 	}
-	st := agg.stats["a"]
+	st := legacy.stats["a"]
 	if st == nil {
 		t.Fatal("no stats for agent a")
+	}
+	if got := agg.seen["a"].events; got != 9 {
+		t.Fatalf("attributed events for a = %d, want 9", got)
 	}
 	if st.events != 9 || st.total != 5 || st.denied != 3 {
 		t.Fatalf("events/total/denied = %d/%d/%d, want 9/5/3", st.events, st.total, st.denied)
@@ -86,7 +96,7 @@ func TestAgentStatsDenyReasonCap(t *testing.T) {
 
 func TestAggregatorDerivedWindow(t *testing.T) {
 	t.Parallel()
-	agg := newAggregator(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), nil)
+	agg, legacy := newLegacyAttributor(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), nil)
 	agg.add(netEvent(ClassNetworkActivity, "sb", false, "", "h", "", 3000))
 	agg.add(netEvent(ClassNetworkActivity, "", false, "", "h", "", 1000))
 	agg.add(netEvent(ClassNetworkActivity, "other", false, "", "h", "", 5000))
@@ -99,23 +109,23 @@ func TestAggregatorDerivedWindow(t *testing.T) {
 	if agg.unmapped != 2 || agg.noContainer != 1 || agg.outOfWindow != 0 {
 		t.Fatalf("unmapped/noContainer/outOfWindow = %d/%d/%d, want 2/1/0", agg.unmapped, agg.noContainer, agg.outOfWindow)
 	}
-	if agg.stats["a"].events != 2 {
-		t.Fatalf("events for a = %d, want 2 (timestamp-less events count)", agg.stats["a"].events)
+	if legacy.stats["a"].events != 2 {
+		t.Fatalf("events for a = %d, want 2 (timestamp-less events count)", legacy.stats["a"].events)
 	}
 }
 
 func TestAggregatorExplicitWindow(t *testing.T) {
 	t.Parallel()
 	window := Window{Start: time.UnixMilli(2000).UTC(), End: time.UnixMilli(4000).UTC()}
-	agg := newAggregator(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), &window)
+	agg, legacy := newLegacyAttributor(mustAgentMap(t, AgentMapping{AgentID: "a", SandboxUIDs: []string{"sb"}}), &window)
 	for _, ms := range []int64{1000, 2000, 4000, 5000, 0} {
 		agg.add(netEvent(ClassNetworkActivity, "sb", false, "", "h", "", ms))
 	}
 	if agg.outOfWindow != 3 || agg.attributed != 2 {
 		t.Fatalf("outOfWindow/attributed = %d/%d, want 3/2", agg.outOfWindow, agg.attributed)
 	}
-	if agg.stats["a"].total != 2 {
-		t.Fatalf("total = %d, want 2", agg.stats["a"].total)
+	if legacy.stats["a"].total != 2 {
+		t.Fatalf("total = %d, want 2", legacy.stats["a"].total)
 	}
 	if got := agg.resolveWindow(time.Now()); got != window {
 		t.Fatalf("resolveWindow() = %v, want %v", got, window)
@@ -124,7 +134,7 @@ func TestAggregatorExplicitWindow(t *testing.T) {
 
 func TestAggregatorWindowFallsBackToNow(t *testing.T) {
 	t.Parallel()
-	agg := newAggregator(AgentMap{}, nil)
+	agg := newAttributor(AgentMap{}, nil)
 	agg.add(Event{ClassUID: ClassBaseEvent})
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.FixedZone("x", 3600))
 	got := agg.resolveWindow(now)

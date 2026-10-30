@@ -18,7 +18,7 @@ func decodeJSON(t *testing.T, raw []byte) map[string]any {
 
 func TestObservationValuesGolden(t *testing.T) {
 	t.Parallel()
-	agg := newAggregator(mustAgentMap(t, AgentMapping{AgentID: "agent-a", SandboxUIDs: []string{"sb"}}), nil)
+	agg, legacy := newLegacyAttributor(mustAgentMap(t, AgentMapping{AgentID: "agent-a", SandboxUIDs: []string{"sb"}}), nil)
 	for _, ev := range []Event{
 		netEvent(ClassNetworkActivity, "sb", false, "", "api.github.com", "", 1000),
 		netEvent(ClassNetworkActivity, "sb", true, "transparent_tcp_policy_denied", "github.com", "", 2000),
@@ -33,7 +33,7 @@ func TestObservationValuesGolden(t *testing.T) {
 	provenance := newProvenance("ans://v1.0.0.ops.example.com", "https://evidence.example/run/1")
 	b := observationBuilder{signals: DefaultSignalConfig(), provenance: provenance, window: window}
 
-	obs, err := b.build(agg.stats["agent-a"])
+	obs, err := b.build(legacy.stats["agent-a"])
 	if err != nil {
 		t.Fatalf("build() error = %v", err)
 	}

@@ -12,6 +12,7 @@ provenance:
 signals:
   policy_violation_rate: openshell.policyViolationRate   # set to "" to disable
   protocol_adherence: openshell.protocolAdherence
+  activity: ""                                           # opt in with hydrator-activity.yaml after registering the signal
 signing:                                                 # optional; signs each batch (X-Ans-Batch-Signature)
   key_file: /var/run/secrets/ans-openshell/platform/key.pem
   cert_file: /var/run/secrets/ans-openshell/platform/cert.pem

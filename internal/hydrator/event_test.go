@@ -95,6 +95,15 @@ func TestReaderRead(t *testing.T) {
 			},
 		},
 		{
+			name: "record copies outside the supervisor framing",
+			input: func(*testing.T) string {
+				return stderrTimestamp + " OCSF NET:OPEN [MED] DENIED example.com:443 [reason:rule_methods=OCSF-JSON " + allowedExampleJSON + "\n" +
+					stderrTimestamp + " xOCSF-JSON " + allowedExampleJSON + "\n" +
+					stderrTimestamp + " OCSF-JSON" + allowedExampleJSON + "\n"
+			},
+			wantStats: ParseStats{Lines: 3, Skipped: 3},
+		},
+		{
 			name: "marker without an object payload",
 			input: func(*testing.T) string {
 				return stderrLine("[1]") + "\n" + stderrLine("") + "\n" + stderrTimestamp + " OCSF-JSON\n"
