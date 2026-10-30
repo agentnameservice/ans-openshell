@@ -52,6 +52,26 @@ Run the tests:
 make cover
 ```
 
+## Repository layout
+
+The repository is two Go modules:
+
+- **Core** (`github.com/agentnameservice/ans-openshell`, repo root) — the
+  generic middleware and its binaries (`make build`). The production
+  `ans-openshell-middleware` is pure middleware: it stamps a
+  transparency-log-vouched ANS identity on a sandbox's outbound traffic and
+  contains **no demo or commerce code**.
+- **Tutorial** (`github.com/agentnameservice/ans-openshell/tutorial`,
+  `./tutorial`) — a dev-only module that consumes the core's `app.Run`
+  extension point and registers a worked-example capability transform
+  (AP2 commerce: mandate + DPoP). It builds its own binary,
+  `ans-demo-middleware` (`make demo-build`), used only by the live demo under
+  `deploy/live-demo/`. It is never shipped.
+
+`make demo-build` generates a gitignored `go.work` so the tutorial module
+resolves the in-repo core; the production build (`make build`) needs no
+workspace.
+
 ## Running the services
 
 Every service takes one YAML file. Flags: `--config` (required), `--listen` to override the

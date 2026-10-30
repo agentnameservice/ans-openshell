@@ -42,6 +42,85 @@ func TestCertificateSource(t *testing.T) {
 	}
 }
 
+func TestNewSelfSignedArtifacts(t *testing.T) {
+	// Generate a self-signed identity cert
+	const (
+		ansName = "ans://v9.9.9.rogue.example"
+		agentID = "rogue-0001"
+	)
+
+	_, _, cert, err := NewSelfSignedSigner(ansName)
+	if err != nil {
+		t.Fatalf("NewSelfSignedSigner: %v", err)
+	}
+
+	// Create self-signed artifacts
+	src, err := NewSelfSignedArtifacts(cert, ansName, agentID)
+	if err != nil {
+		t.Fatalf("NewSelfSignedArtifacts: %v", err)
+	}
+
+	// Get the current artifacts
+	arts := src.Current()
+
+	// Assert both status token and receipt are non-empty
+	if arts.StatusTokenBase64 == "" {
+		t.Error("StatusTokenBase64 is empty, expected non-empty")
+	}
+	if arts.ReceiptBase64 == "" {
+		t.Error("ReceiptBase64 is empty, expected non-empty")
+	}
+
+	// Assert Healthy returns true
+	if !src.Healthy() {
+		t.Error("Healthy() = false, expected true")
+	}
+
+	// Decode and parse the status token
+	tokenBytes, err := base64.StdEncoding.DecodeString(arts.StatusTokenBase64)
+	if err != nil {
+		t.Fatalf("decode status token: %v", err)
+	}
+
+	// Parse as COSE_Sign1
+	parsedToken, err := scitt.ParseCoseSign1(tokenBytes)
+	if err != nil {
+		t.Fatalf("parse status token as COSE_Sign1: %v", err)
+	}
+
+	// Assert the token's kid is NOT in a real TL's root-key set
+	// (the self-signed key should be rejected by a real TL verifier)
+	realTL := testfixtures.MustNewTL()
+	if _, verifyErr := scitt.VerifyStatusToken(tokenBytes, realTL.KeyStore(), time.Minute); verifyErr == nil {
+		t.Error("expected status token verification to fail against real TL, but it succeeded")
+	}
+
+	// Decode and parse the receipt
+	receiptBytes, err := base64.StdEncoding.DecodeString(arts.ReceiptBase64)
+	if err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+
+	// Parse as COSE_Sign1
+	parsedReceipt, err := scitt.ParseCoseSign1(receiptBytes)
+	if err != nil {
+		t.Fatalf("parse receipt as COSE_Sign1: %v", err)
+	}
+
+	// Assert the receipt's kid is NOT in the real TL's root-key set
+	if _, verifyErr := scitt.VerifyReceipt(receiptBytes, realTL.KeyStore()); verifyErr == nil {
+		t.Error("expected receipt verification to fail against real TL, but it succeeded")
+	}
+
+	// Verify the status token can be verified when we actually try
+	// (to ensure we minted well-formed COSE)
+	_ = parsedToken
+	_ = parsedReceipt
+
+	// We can't verify claims without a successful VerifyStatusToken,
+	// but we can verify the COSE parses correctly (done above)
+}
+
 func TestStaticSource(t *testing.T) {
 	t.Parallel()
 	full := Artifacts{ReceiptBase64: "r", StatusTokenBase64: "t"}

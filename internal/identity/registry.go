@@ -37,6 +37,11 @@ type Config struct {
 	// fetching them from the transparency log. Both or neither must be set.
 	ReceiptFile     string `yaml:"receipt_file"`
 	StatusTokenFile string `yaml:"status_token_file"`
+	// DevMode builds the identity from self-signed components (NewSelfSignedSigner
+	// and NewSelfSignedArtifacts) instead of loading keys and certificates from
+	// files. When true, KeyFile, CertFile, ReceiptFile and StatusTokenFile must
+	// not be set.
+	DevMode bool `yaml:"dev_mode"`
 }
 
 // Identity is one ANS identity the middleware can sign as.
@@ -191,6 +196,40 @@ func (l *loader) identity(ctx context.Context, name string, cfg Config) (*Identi
 	if cfg.AgentID == "" {
 		return nil, fmt.Errorf("identity %q: agent_id must not be empty", name)
 	}
+
+	// Dev-mode path: build identity from self-signed components
+	if cfg.DevMode {
+		// Reject config that sets both dev_mode and file paths
+		if cfg.KeyFile != "" || cfg.CertFile != "" {
+			return nil, fmt.Errorf("identity %q: dev_mode must not set key_file/cert_file", name)
+		}
+		if cfg.ReceiptFile != "" || cfg.StatusTokenFile != "" {
+			return nil, fmt.Errorf("identity %q: dev_mode must not set receipt_file/status_token_file", name)
+		}
+
+		// Build self-signed signer
+		signer, _, cert, signerErr := NewSelfSignedSigner(cfg.AnsName)
+		if signerErr != nil {
+			return nil, fmt.Errorf("identity %q: self-signed signer: %w", name, signerErr)
+		}
+
+		// Build self-signed artifacts
+		artifacts, artifactsErr := NewSelfSignedArtifacts(cert, cfg.AnsName, cfg.AgentID)
+		if artifactsErr != nil {
+			return nil, fmt.Errorf("identity %q: self-signed artifacts: %w", name, artifactsErr)
+		}
+
+		// Wrap with certificate-validity gate
+		artifacts = &certificateSource{ArtifactSource: artifacts, cert: cert, now: time.Now}
+
+		// Log dev-mode warning
+		l.log.WarnContext(ctx, "dev-mode identity: self-signed, NOT vouched by any transparency log",
+			"identity", name, "ans_name", cfg.AnsName)
+
+		return NewIdentity(name, cfg.AnsName, cfg.AgentID, signer, artifacts)
+	}
+
+	// File-based path (existing code)
 	signer, cert, err := loadSigner(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("identity %q: %w", name, err)

@@ -55,6 +55,34 @@ jobs:
           version: v2.10.1
           args: --verbose --concurrency=4 --allow-parallel-runners
 
+  tutorial:
+    name: Tutorial module (demo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e #v7.0.0
+        with:
+          go-version: "1.26.9"
+      # The tutorial module (dev-only demo) consumes the core via a workspace.
+      # go.work is gitignored; generate it here (not committed) so the module
+      # resolves the in-repo core at its v0.0.0 placeholder version.
+      - name: Generate workspace
+        run: |
+          rm -f go.work go.work.sum
+          go work init . ./tutorial
+          go work edit -replace github.com/agentnameservice/ans-openshell@v0.0.0=./
+      - name: Build (tutorial)
+        run: go build ./tutorial/...
+      - name: Build demo binary
+        run: go build -o bin/ans-demo-middleware ./tutorial/cmd/ans-demo-middleware
+      - name: Test (tutorial)
+        run: go test -race ./tutorial/...
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a #v9.3.0
+        with:
+          version: v2.10.1
+          args: --verbose --concurrency=4 --allow-parallel-runners
+          working-directory: tutorial
+
   deploy-artifacts:
     name: Container images & Helm chart
     runs-on: ubuntu-latest

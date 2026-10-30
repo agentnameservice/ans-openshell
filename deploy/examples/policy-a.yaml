@@ -1,0 +1,32 @@
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log]
+  read_write: [/tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+network_policies:
+  ingress:
+    name: ingress
+    endpoints:
+      - host: <HOST_IP>
+        port: 50060
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - { path: /bin/busybox }
+      - { path: /usr/bin/wget }
+
+network_middlewares:
+  ans-egress-a:
+    name: ans-egress-a
+    middleware: ans-egress-a
+    order: 0
+    config: {}
+    on_error: fail_closed
+    endpoints:
+      include: ["<HOST_IP>"]

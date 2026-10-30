@@ -2,12 +2,19 @@ package identity
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
+
+	"github.com/agentnameservice/ans-openshell/internal/selfsign"
 )
 
 // Artifacts are the SCITT headers a signed request carries, base64-encoded as
@@ -128,4 +135,48 @@ func readArtifactFiles(receiptFile, statusTokenFile string) ([]byte, []byte, err
 		return nil, nil, fmt.Errorf("read status_token_file: %w", err)
 	}
 	return receipt, token, nil
+}
+
+// NewSelfSignedArtifacts generates a static ArtifactSource with self-signed
+// status token and receipt artifacts for dev-mode identities. It generates an
+// ephemeral ES256 "TL" key internally, mints a status token (status ACTIVE,
+// iat=now-1min, exp=now+1h, ValidIdentityCerts=[sha256(cert.Raw)], ansName,
+// agentID) and a receipt over (agentID, ansName), base64-encodes both, and
+// returns a static ArtifactSource.
+//
+// The artifacts are signed by an ephemeral key that is NOT in any real
+// transparency log's root-key set, so they will be rejected by the ingress
+// verify_caller middleware when it checks the status token against the live TL.
+func NewSelfSignedArtifacts(cert *x509.Certificate, ansName, agentID string) (ArtifactSource, error) {
+	// Generate ephemeral ES256 key for signing
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ephemeral key: %w", err)
+	}
+
+	// Compute cert fingerprint
+	certFP := sha256.Sum256(cert.Raw)
+
+	// Mint status token: iat=now-1min, exp=now+1h
+	now := time.Now()
+	iat := now.Add(-time.Minute).Unix()
+	exp := now.Add(time.Hour).Unix()
+	statusTokenBytes, err := selfsign.StatusToken(key, agentID, ansName, scitt.StatusActive, iat, exp, certFP)
+	if err != nil {
+		return nil, fmt.Errorf("mint status token: %w", err)
+	}
+
+	// Mint receipt
+	receiptBytes, err := selfsign.Receipt(key, agentID, ansName)
+	if err != nil {
+		return nil, fmt.Errorf("mint receipt: %w", err)
+	}
+
+	// Base64-encode both
+	artifacts := Artifacts{
+		ReceiptBase64:     base64.StdEncoding.EncodeToString(receiptBytes),
+		StatusTokenBase64: base64.StdEncoding.EncodeToString(statusTokenBytes),
+	}
+
+	return NewStaticSource(artifacts), nil
 }

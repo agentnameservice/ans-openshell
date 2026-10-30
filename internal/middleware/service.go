@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/agentnameservice/ans-openshell/gen/openshell/extensionv1"
 	"github.com/agentnameservice/ans-openshell/gen/openshell/middlewarev1"
+	"github.com/agentnameservice/ans-openshell/internal/capability"
 	"github.com/agentnameservice/ans-openshell/internal/extauth"
 	"github.com/agentnameservice/ans-openshell/internal/identity"
 	"github.com/agentnameservice/ans-openshell/internal/vetting"
@@ -99,11 +101,13 @@ type IdentityLookup interface {
 // it.
 type Service struct {
 	middlewarev1.UnimplementedSupervisorMiddlewareServer
-	ids   IdentityLookup
-	authz IdentityAuthorizer
-	vet   vetting.Verifier
-	cfg   Config
-	log   *slog.Logger
+	ids        IdentityLookup
+	authz      IdentityAuthorizer
+	vet        vetting.Verifier
+	cfg        Config
+	log        *slog.Logger
+	rewriters  []capability.Transform
+	discoverer capability.Discoverer
 }
 
 // NewService builds the service. vet may be nil when destination vetting is not
@@ -120,6 +124,18 @@ func NewService(ids IdentityLookup, authz IdentityAuthorizer, vet vetting.Verifi
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Service{ids: ids, authz: authz, vet: vet, cfg: cfg.withDefaults(), log: logger}
+}
+
+// AddTransform appends a Transform to the service's rewriter chain.
+func (s *Service) AddTransform(t capability.Transform) *Service {
+	s.rewriters = append(s.rewriters, t)
+	return s
+}
+
+// WithDiscoverer sets the capability discoverer for the service.
+func (s *Service) WithDiscoverer(d capability.Discoverer) *Service {
+	s.discoverer = d
+	return s
 }
 
 // Describe negotiates the protocol with the gateway and returns the manifest:
@@ -144,10 +160,18 @@ func (s *Service) Describe(ctx context.Context,
 	if s.cfg.RequestTimeout > 0 {
 		binding.RequestTimeout = durationpb.New(s.cfg.RequestTimeout)
 	}
+	responseBinding := &middlewarev1.MiddlewareBinding{
+		Operation:       middlewarev1.SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE,
+		Phase:           middlewarev1.SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN,
+		MaxPayloadBytes: s.cfg.MaxPayloadBytes,
+	}
+	if s.cfg.RequestTimeout > 0 {
+		responseBinding.RequestTimeout = durationpb.New(s.cfg.RequestTimeout)
+	}
 	return &middlewarev1.MiddlewareManifest{
 		Name:             ManifestName,
 		ServiceVersion:   s.cfg.ImplementationVersion,
-		Bindings:         []*middlewarev1.MiddlewareBinding{binding},
+		Bindings:         []*middlewarev1.MiddlewareBinding{binding, responseBinding},
 		ExpectedAudience: s.cfg.Audience,
 		Extension: &extensionv1.PeerMetadata{
 			ProtocolVersion:       &extensionv1.ProtocolVersion{Major: ProtocolMajor, Minor: ProtocolMinor},
@@ -273,10 +297,54 @@ func (s *Service) evaluate(ctx context.Context, req *middlewarev1.HttpRequestEva
 	if !s.authz.Allows(req.GetContext().GetSandboxId(), policy.Identity) {
 		return out.deny(&denial{ReasonIdentityUnauthorized, "sandbox is not authorized to use the selected identity"})
 	}
-	if containsCredentialMarker(req.GetBody()) || containsCredentialMarker([]byte(req.GetTarget().GetPath())) {
+
+	// R1 pipeline: compute signBody, run transform chain, guard on rewritten bytes, then sign.
+	signBody := req.GetBody()
+
+	// Build target for transforms
+	tool := extractToolName(signBody)
+	capTarget := capability.Target{
+		Host:   req.GetTarget().GetHost(),
+		Method: method,
+		Path:   req.GetTarget().GetPath(),
+		Tool:   tool,
+	}
+
+	// Discover requirements (best-effort)
+	var requirement capability.Requirement
+	if s.discoverer != nil {
+		requirement = s.discoverer.Discover(ctx, capTarget)
+	}
+
+	// Run transform chain
+	var signURL string
+	for _, t := range s.rewriters {
+		tr := t.Apply(ctx, capTarget, requirement, signBody)
+		switch tr.Kind {
+		case capability.Deny:
+			return out.deny(&denial{ReasonRewriteDenied, "rewrite denied: " + tr.Reason})
+		case capability.Allow:
+			signBody = tr.Body
+			out.setBody(tr.Body)
+			// G1: capture SignURL from transforms (last writer wins).
+			signURL = tr.SignURL
+			s.narrate(ctx, t, tr) // observability only; no effect on the request
+		case capability.Passthrough:
+			// Continue to next transform
+		}
+	}
+
+	// Credential marker guard runs on signBody (post-chain bytes)
+	if containsCredentialMarker(signBody) || containsCredentialMarker([]byte(req.GetTarget().GetPath())) {
 		return out.deny(&denial{ReasonRequestRewriteUnsupported, "credential placeholders in a signed body or path require signing after credential rewriting"})
 	}
-	if d := s.attach(ctx, id, method, target, req.GetBody(), out); d != nil {
+
+	// Sign the (potentially rewritten) body with signURL (if set) or target (G1: external URL binding).
+	htu := target
+	if signURL != "" {
+		htu = signURL
+	}
+	if d := s.attach(ctx, id, method, htu, signBody, out); d != nil {
 		return out.deny(d)
 	}
 	return out.allow()
@@ -368,6 +436,15 @@ func (s *Service) attach(ctx context.Context, id *identity.Identity, method, tar
 	return nil
 }
 
+// narrate lets a transform render the artifacts it attached to an Allow'd
+// request, if it implements capability.Narratable. Observability only; the core
+// never interprets the artifacts and narration is debug-gated in the transform.
+func (s *Service) narrate(ctx context.Context, t capability.Transform, tr capability.Outcome) {
+	if n, ok := t.(capability.Narratable); ok {
+		n.Narrate(ctx, tr, s.log)
+	}
+}
+
 func destinationSeverity(st vetting.Status) string {
 	switch st {
 	case vetting.StatusRegistered, vetting.StatusExempt:
@@ -400,6 +477,8 @@ type outcome struct {
 	findings  []*middlewarev1.Finding
 	metadata  map[string]string
 	mutations []*middlewarev1.HeaderMutation
+	body      []byte
+	hasBody   bool
 }
 
 func (o *outcome) finding(typ, label, confidence, severity string) {
@@ -425,6 +504,11 @@ func (o *outcome) write(name, value string) {
 	})
 }
 
+func (o *outcome) setBody(b []byte) {
+	o.body = b
+	o.hasBody = true
+}
+
 // strip removes the identity headers and records the finding.
 func (o *outcome) strip() {
 	for _, name := range []string{pop.DPoPHeader, scitt.HeaderReceipt, scitt.HeaderStatusToken} {
@@ -436,12 +520,17 @@ func (o *outcome) strip() {
 }
 
 func (o *outcome) allow() *middlewarev1.HttpRequestResult {
-	return &middlewarev1.HttpRequestResult{
+	res := &middlewarev1.HttpRequestResult{
 		Decision:        middlewarev1.Decision_DECISION_ALLOW,
 		HeaderMutations: o.mutations,
 		Findings:        o.findings,
 		Metadata:        o.metadata,
 	}
+	if o.hasBody {
+		res.Body = o.body
+		res.HasBody = true
+	}
+	return res
 }
 
 func (o *outcome) deny(d *denial) *middlewarev1.HttpRequestResult {
@@ -452,4 +541,22 @@ func (o *outcome) deny(d *denial) *middlewarev1.HttpRequestResult {
 		Findings:   o.findings,
 		Metadata:   o.metadata,
 	}
+}
+
+// extractToolName attempts to extract the MCP tool name from a JSON-RPC request body.
+// Returns empty string on any parse error or if method != "tools/call".
+func extractToolName(body []byte) string {
+	var req struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	if req.Method != "tools/call" {
+		return ""
+	}
+	return req.Params.Name
 }

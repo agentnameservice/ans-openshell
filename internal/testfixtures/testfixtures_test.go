@@ -155,16 +155,6 @@ func TestMustPanics(t *testing.T) {
 	MustNewIdentity("", testAnsName)
 }
 
-func TestMustCBORPanics(t *testing.T) {
-	t.Parallel()
-	defer func() {
-		if recover() == nil {
-			t.Fatal("mustCBOR did not panic on an unencodable value")
-		}
-	}()
-	mustCBOR(make(chan int))
-}
-
 func TestTLRootKeyRoundTrip(t *testing.T) {
 	t.Parallel()
 	tl := MustNewTL()

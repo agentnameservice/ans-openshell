@@ -12,17 +12,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
+
+	"github.com/agentnameservice/ans-openshell/internal/selfsign"
 )
 
 const (
 	pemTypePKCS8       = "PRIVATE KEY"
 	pemTypeCertificate = "CERTIFICATE"
-	kidLen             = 4
 )
 
 // NewP256Key generates a fresh ECDSA P-256 private key.
@@ -52,13 +52,10 @@ func CertificatePEM(der []byte) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der})
 }
 
-// kidFor derives the SDK's 4-byte key identifier, SHA-256(SPKI)[:4], from a
-// DER-encoded SubjectPublicKeyInfo.
-func kidFor(spkiDER []byte) [kidLen]byte {
-	sum := sha256.Sum256(spkiDER)
-	var kid [kidLen]byte
-	copy(kid[:], sum[:kidLen])
-	return kid
+// kidFor derives the SDK's 4-byte key identifier from DER-encoded SPKI.
+// It delegates to selfsign.KidFromSPKI for the shared kid computation logic.
+func kidFor(spkiDER []byte) [selfsign.KidLen]byte {
+	return selfsign.KidFromSPKI(spkiDER)
 }
 
 // must panics on an error from encoding or signing data this package built

@@ -291,3 +291,103 @@ func TestEndToEndExpiredTokenDenies(t *testing.T) {
 		t.Fatalf("evaluate = %v, %v, want DENY %s", res, err, ReasonStatusTokenUnavailable)
 	}
 }
+
+// TestEvaluate_DevModeIdentity_StampsAllThreeHeaders verifies that a dev-mode
+// (self-signed) rogue identity is stamped at egress with DPoP, receipt, and
+// status token headers. The test proves the rogue is NOT denied at the egress
+// middleware — the honest 401 rejection happens downstream at ingress when the
+// self-signed artifacts fail verification against the live transparency log.
+func TestEvaluate_DevModeIdentity_StampsAllThreeHeaders(t *testing.T) {
+	t.Parallel()
+
+	// Build a dev-mode identity directly with self-signed components
+	const rogueAnsName = "ans://v9.9.9.rogue.example"
+	const rogueAgentID = "rogue-0001"
+	const rogueIdentityName = "rogue"
+
+	signer, _, cert, err := identity.NewSelfSignedSigner(rogueAnsName)
+	if err != nil {
+		t.Fatalf("NewSelfSignedSigner: %v", err)
+	}
+
+	src, err := identity.NewSelfSignedArtifacts(cert, rogueAnsName, rogueAgentID)
+	if err != nil {
+		t.Fatalf("NewSelfSignedArtifacts: %v", err)
+	}
+
+	id, err := identity.NewIdentity(rogueIdentityName, rogueAnsName, rogueAgentID, signer, src)
+	if err != nil {
+		t.Fatalf("NewIdentity: %v", err)
+	}
+
+	reg, err := identity.NewRegistryFromIdentities(id)
+	if err != nil {
+		t.Fatalf("NewRegistryFromIdentities: %v", err)
+	}
+	t.Cleanup(reg.Close)
+
+	// Build a service with an authorizer that allows the rogue identity for testSandbox
+	authorizer := sandboxAuthorizer(testSandbox)
+	service := NewService(reg, authorizer, nil, Config{}, nil)
+
+	// Build a policy naming the rogue identity in sign mode
+	policy := map[string]any{"identity": rogueIdentityName}
+
+	// Evaluate a POST request
+	body := []byte(`{"data":"test"}`)
+	eval := &middlewarev1.HttpRequestEvaluation{
+		Phase:   preCredentials,
+		Context: &middlewarev1.RequestContext{RequestId: "req-rogue", SandboxId: testSandbox},
+		Config:  structOf(t, policy),
+		Target:  &middlewarev1.HttpRequestTarget{Scheme: "https", Host: "target.example.com", Port: 443, Method: "POST", Path: "/v1/test"},
+		Body:    body,
+	}
+
+	res, err := service.EvaluateHttpRequest(t.Context(), eval)
+	if err != nil {
+		t.Fatalf("EvaluateHttpRequest: %v", err)
+	}
+
+	// Assert: Decision == ALLOW (rogue is stamped, not denied at egress)
+	if res.GetDecision() != allow {
+		t.Fatalf("Decision = %v, want ALLOW; reason_code = %s", res.GetDecision(), res.GetReasonCode())
+	}
+
+	// Collect header mutations
+	headers := make(map[string]string)
+	for _, m := range res.GetHeaderMutations() {
+		if op, ok := m.GetOperation().(*middlewarev1.HeaderMutation_Write); ok {
+			headers[op.Write.GetName()] = op.Write.GetValue()
+		}
+	}
+
+	// Assert: all three ANS headers are present
+	dpopHeader, hasDPoP := headers[pop.DPoPHeader]
+	receiptHeader, hasReceipt := headers[scitt.HeaderReceipt]
+	statusTokenHeader, hasStatusToken := headers[scitt.HeaderStatusToken]
+
+	if !hasDPoP {
+		t.Errorf("missing DPoP header %q", pop.DPoPHeader)
+	}
+	if !hasReceipt {
+		t.Errorf("missing receipt header %q", scitt.HeaderReceipt)
+	}
+	if !hasStatusToken {
+		t.Errorf("missing status token header %q", scitt.HeaderStatusToken)
+	}
+
+	// Assert: status token is NON-EMPTY (the key requirement)
+	if statusTokenHeader == "" {
+		t.Errorf("status token header is empty")
+	}
+
+	// Also verify the receipt is non-empty (proving Task 2 minted both artifacts)
+	if receiptHeader == "" {
+		t.Errorf("receipt header is empty")
+	}
+
+	// DPoP should also be non-empty
+	if dpopHeader == "" {
+		t.Errorf("DPoP header is empty")
+	}
+}
