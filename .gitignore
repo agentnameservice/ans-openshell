@@ -11,6 +11,7 @@
 /ans-ocsf-hydrator
 /ans-reference-callee
 /demo
+/fixtures
 
 # Test binaries, built with `go test -c`
 *.test
