@@ -104,7 +104,7 @@ func TestHTTPSinkPostRequest(t *testing.T) {
 	t.Run("unauthenticated and unsigned", func(t *testing.T) {
 		t.Parallel()
 		srv, captured := captureServer(t, http.StatusCreated, "")
-		sink, err := NewHTTPSink(srv.URL, "", nil)
+		sink, err := NewHTTPSink(srv.URL, "", srv.Client())
 		if err != nil {
 			t.Fatalf("NewHTTPSink() error = %v", err)
 		}
@@ -191,7 +191,7 @@ func TestHTTPSinkPostErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			srv, _ := captureServer(t, tt.status, tt.response)
-			sink, err := NewHTTPSink(srv.URL, "k", nil)
+			sink, err := NewHTTPSink(srv.URL, "k", srv.Client())
 			if err != nil {
 				t.Fatalf("NewHTTPSink() error = %v", err)
 			}

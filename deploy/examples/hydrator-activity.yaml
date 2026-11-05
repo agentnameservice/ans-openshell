@@ -1,0 +1,20 @@
+# Opt-in policy-adherence output for the Trust Index reference implementation
+# (agent-trust-discovery). Register openshell.behavior.activity first and keep
+# its profile weight 0 until the consumer can invalidate stale scores.
+# Use ANS_TRUST_INDEX_ADMIN_KEY for the existing import route's Bearer key.
+trust_index:
+  base_url: https://trust-index.example.com
+provenance:
+  aim_id: ans://v1.0.0.collector.example.com
+signals:
+  policy_violation_rate: ""
+  protocol_adherence: ""
+  activity: openshell.behavior.activity
+activity:
+  min_decisions: 1
+  max_uids_per_agent: 100000
+  max_uids: 1000000
+agents:
+  - agent_id: "00000000-0000-4000-8000-000000000001"
+    ans_name: ans://v1.0.0.probe.example.com
+    sandbox_names: [probe]

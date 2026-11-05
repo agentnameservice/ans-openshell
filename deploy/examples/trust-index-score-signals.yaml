@@ -1,0 +1,6 @@
+# For agent-trust-discovery, referenced by runtime config signals.path.
+# Merge with the deployment's existing registrations; do not replace them.
+signals:
+  - id: openshell.behavior.activity
+    dimension: behavior
+    threshold: 0   # disable the generic low-score risk code; this output scores adherence only

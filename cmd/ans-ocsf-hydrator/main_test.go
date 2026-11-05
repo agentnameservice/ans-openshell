@@ -36,6 +36,40 @@ func TestEmptyRunError(t *testing.T) {
 	}
 }
 
+func TestDegradedRunError(t *testing.T) {
+	t.Parallel()
+	score := 100
+	degraded := hydrator.ActivityEvidence{Unavailable: "interpretation_incomplete"}
+	quiet := hydrator.ActivityEvidence{Unavailable: "no_eligible_decisions"}
+	scored := hydrator.ActivityEvidence{Score: &score}
+	tests := []struct {
+		name         string
+		report       hydrator.Report
+		emitActivity bool
+		allow        bool
+		wantErr      error
+	}{
+		{name: "legacy only", report: hydrator.Report{}},
+		{name: "unreadable audit records", report: hydrator.Report{UnreadableAuditRecords: 1}, emitActivity: true, wantErr: errUnreadableAudit},
+		{name: "unreadable audit records in evidence-only run", report: hydrator.Report{UnreadableAuditRecords: 1}, wantErr: errUnreadableAudit},
+		{name: "unreadable audit records accepted", report: hydrator.Report{UnreadableAuditRecords: 1}, emitActivity: true, allow: true},
+		{name: "every score withheld", report: hydrator.Report{Activity: []hydrator.ActivityEvidence{degraded, degraded}}, emitActivity: true, wantErr: errActivityWithheld},
+		{name: "every score withheld accepted", report: hydrator.Report{Activity: []hydrator.ActivityEvidence{degraded}}, emitActivity: true, allow: true},
+		{name: "every score withheld in evidence-only run", report: hydrator.Report{Activity: []hydrator.ActivityEvidence{degraded}}},
+		{name: "one score posted", report: hydrator.Report{Activity: []hydrator.ActivityEvidence{degraded, scored}}, emitActivity: true},
+		{name: "quiet agents are not withheld", report: hydrator.Report{Activity: []hydrator.ActivityEvidence{degraded, quiet}}, emitActivity: true},
+		{name: "no activity evidence", report: hydrator.Report{}, emitActivity: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if err := degradedRunError(tt.report, tt.emitActivity, tt.allow); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("degradedRunError() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestWindowFlags(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 10, 19, 16, 0, 0, 0, time.FixedZone("x", -5*3600))

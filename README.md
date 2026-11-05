@@ -80,9 +80,18 @@ traffic, so it is not the input.
 
 `--dry-run` prints the import request instead of posting it; `--window-start` and
 `--window-end` (RFC 3339) pin the observation window. The job exits non-zero when events were
-parsed but none mapped to a configured agent, which usually means the sandbox mapping drifted;
+parsed but none mapped to a configured agent, which usually means the sandbox mapping drifted,
+or when the optional activity output is degraded (see `docs/hydrator-activity.md`);
 `--allow-unmapped` accepts that. The Trust Index admin key comes from
 `trust_index.admin_key_file` or the `ANS_TRUST_INDEX_ADMIN_KEY` environment variable.
+
+The optional `openshell.behavior.activity` output applies corrected policy-decision
+counting and imports directly into the Trust Index reference implementation
+(`agent-trust-discovery`). See [policy-adherence setup and migration](docs/hydrator-activity.md)
+for its signal registration, a weight-0 rollout, and `--evidence-output` JSONL.
+The new output is off by default; legacy outputs retain their existing behavior.
+Findings remain evidence and explanation text, without changing the adherence score.
+Keep the new signal's weight 0 until the consumer can invalidate stale scores.
 
 The reference callee takes flags only:
 

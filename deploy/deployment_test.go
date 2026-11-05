@@ -94,6 +94,17 @@ type renderedResource struct {
 				Annotations map[string]string `yaml:"annotations"`
 			} `yaml:"metadata"`
 		} `yaml:"template"`
+		JobTemplate struct {
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Args []string `yaml:"args"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		} `yaml:"jobTemplate"`
 	} `yaml:"spec"`
 }
 
@@ -142,10 +153,10 @@ func TestJWKSURLChangesRollBothServices(t *testing.T) {
 	}
 }
 
-func renderChart(t *testing.T, helm, jwksURL string) map[string]renderedResource {
+func renderChart(t *testing.T, helm, jwksURL string, extraArgs ...string) map[string]renderedResource {
 	t.Helper()
-	data, err := exec.CommandContext(t.Context(), helm, "template", "regression", "helm/ans-openshell",
-		"--set-string", "gateway.jwksURL="+jwksURL).CombinedOutput()
+	args := append([]string{"template", "regression", "helm/ans-openshell", "--set-string", "gateway.jwksURL=" + jwksURL}, extraArgs...)
+	data, err := exec.CommandContext(t.Context(), helm, args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("render Helm chart: %v\n%s", err, data)
 	}
