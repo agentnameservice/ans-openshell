@@ -50,19 +50,20 @@ func NewAgentMap(mappings []AgentMapping) (AgentMap, error) {
 	return m, nil
 }
 
-// Lookup resolves the event's sandbox to an agent, by container.uid first and
-// container.name second. Events without a container never resolve.
+// Lookup resolves the event's sandbox (see Event.Sandbox) to an agent, by uid
+// first and name second. Events without a sandbox never resolve.
 func (m AgentMap) Lookup(ev Event) (AgentMapping, bool) {
-	if ev.Container == nil {
+	sandbox := ev.Sandbox()
+	if sandbox == nil {
 		return AgentMapping{}, false
 	}
-	if ev.Container.UID != "" {
-		if mapping, ok := m.byUID[ev.Container.UID]; ok {
+	if sandbox.UID != "" {
+		if mapping, ok := m.byUID[sandbox.UID]; ok {
 			return mapping, true
 		}
 	}
-	if ev.Container.Name != "" {
-		if mapping, ok := m.byName[ev.Container.Name]; ok {
+	if sandbox.Name != "" {
+		if mapping, ok := m.byName[sandbox.Name]; ok {
 			return mapping, true
 		}
 	}

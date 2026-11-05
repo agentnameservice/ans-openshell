@@ -49,6 +49,7 @@ type Event struct {
 	Message       string        `json:"message"`
 	Time          int64         `json:"time"`
 	Metadata      Metadata      `json:"metadata"`
+	Device        *Device       `json:"device"`
 	Container     *Container    `json:"container"`
 	DstEndpoint   *Endpoint     `json:"dst_endpoint"`
 	Actor         *Actor        `json:"actor"`
@@ -73,8 +74,16 @@ type Product struct {
 	Version    string `json:"version"`
 }
 
+// Device is the OCSF device object. Only its container is read: the device's
+// own uid, name and hostname describe where the emitter runs, never which
+// sandbox an event belongs to.
+type Device struct {
+	Container *Container `json:"container"`
+}
+
 // Container is the sandbox the event belongs to. OpenShell omits it for
-// events without a sandbox association and strips it on schema downgrade.
+// events without a sandbox association; releases before v0.1.7 also stripped
+// it on schema downgrade.
 type Container struct {
 	UID  string `json:"uid"`
 	Name string `json:"name"`
@@ -111,6 +120,18 @@ func (e Event) Timestamp() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.UnixMilli(e.Time).UTC(), true
+}
+
+// Sandbox returns the sandbox the event belongs to, or nil when it has none.
+// OpenShell releases after v0.1.7 carry it in device.container and earlier
+// releases in the top-level container. A device.container with neither uid
+// nor name is treated as absent so it cannot hide a usable top-level one.
+func (e Event) Sandbox() *Container {
+	if e.Device != nil && e.Device.Container != nil &&
+		(e.Device.Container.UID != "" || e.Device.Container.Name != "") {
+		return e.Device.Container
+	}
+	return e.Container
 }
 
 // Denied reports whether the event was denied, blocked or failed: any of

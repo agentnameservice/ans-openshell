@@ -8,10 +8,11 @@
 // MaxLineBytes, unknown fields are ignored, missing fields are tolerated and a
 // malformed line is counted and skipped, never fatal.
 //
-// Events are attributed to agents through their sandbox (container.uid, then
-// container.name). Records that OpenShell downgraded to OCSF 1.1 or 1.3 have
-// the container stripped and therefore cannot be attributed; they are counted
-// as unmapped.
+// Events are attributed to agents through their sandbox (uid, then name),
+// read from device.container and, for OpenShell v0.1.7 and earlier, from the
+// top-level container. Records without either, such as those an earlier
+// release downgraded to OCSF 1.1 or 1.3, cannot be attributed; they are
+// counted as unmapped.
 //
 // Per agent and input window the package aggregates Network Activity (4001)
 // and HTTP Activity (4002) events into two observations. An event counts as
