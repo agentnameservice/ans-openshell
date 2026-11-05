@@ -5,7 +5,7 @@ LINT_GOTOOLCHAIN ?= local
 BIN := bin
 CMDS := ans-openshell-middleware ans-openshell-interceptor ans-ocsf-hydrator ans-reference-callee
 
-.PHONY: all build proto test cover lint vet demo clean
+.PHONY: all build proto test cover lint vet demo openshell-smoke clean
 
 all: build
 
@@ -44,3 +44,7 @@ demo:
 
 clean:
 	rm -rf $(BIN) coverage*.out
+
+# End-to-end check against a real OpenShell gateway (Docker). See examples/openshell-smoke/README.md.
+openshell-smoke:
+	examples/openshell-smoke/smoke.sh
