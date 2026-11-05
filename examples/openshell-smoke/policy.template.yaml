@@ -1,0 +1,33 @@
+# Sandbox policy for the smoke test. smoke.sh fills in the placeholders.
+# The workload may POST /v1/tasks to the reference callee on the gateway host;
+# every such request is signed by the ANS middleware, which runs last in the
+# chain and blocks the request when it cannot sign.
+version: 1
+
+network_middlewares:
+  ans-identity:
+    name: ANS identity
+    middleware: __MIDDLEWARE_NAME__
+    order: 100
+    on_error: fail_closed
+    endpoints:
+      include:
+        - host.openshell.internal
+    config:
+      mode: sign
+      identity: __IDENTITY__
+
+network_policies:
+  callee:
+    name: callee
+    endpoints:
+      - host: host.openshell.internal
+        port: __CALLEE_PORT__
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /v1/tasks
+    binaries:
+      - path: /usr/bin/curl
