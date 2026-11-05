@@ -98,7 +98,8 @@ jobs:
         run: |
           source examples/openshell-smoke/openshell-release.env
           for f in extension gateway_interceptor supervisor_middleware; do
-            curl -fsSL "https://raw.githubusercontent.com/NVIDIA/OpenShell/$OPENSHELL_COMMIT/proto/$f.proto" \
-              | diff -u "third_party/openshell/proto/$f.proto" - \
+            curl -fsSL --connect-timeout 15 --max-time 60 -o "$RUNNER_TEMP/$f.proto" \
+              "https://raw.githubusercontent.com/NVIDIA/OpenShell/$OPENSHELL_COMMIT/proto/$f.proto"
+            diff -u "third_party/openshell/proto/$f.proto" "$RUNNER_TEMP/$f.proto" \
               || { echo "third_party/openshell/proto/$f.proto differs from OpenShell $OPENSHELL_VERSION ($OPENSHELL_COMMIT)"; exit 1; }
           done

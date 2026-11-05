@@ -62,9 +62,12 @@ reported there, not here.
 The test never touches an existing OpenShell installation: it points `XDG_CONFIG_HOME`,
 `XDG_STATE_HOME` and `OPENSHELL_LOCAL_TLS_DIR` at its temporary directory, so the gateway's
 database, TLS bundle and the CLI's gateway registration all live and die with the run. On the
-Docker daemon its gateway works under its own `sandbox_label`, `ans-openshell-smoke`, so the
-startup reconciliation that removes a gateway's stray supervisor containers cannot reach another
-gateway's sandboxes, and leftovers from a crashed run are reclaimed by the next one.
+Docker daemon its gateway works under a `sandbox_label` of its own, `ans-openshell-smoke-<pid>`,
+so the startup reconciliation that removes a gateway's stray supervisor containers cannot reach
+another gateway's sandboxes, whether that gateway belongs to an OpenShell install or to a
+concurrent smoke run. When a run ends, including by failure, the harness removes every container
+and volume left under its label. A run that dies before its own cleanup leaves its label behind;
+the next run removes everything under a label whose pid no longer runs.
 
 ## Options
 

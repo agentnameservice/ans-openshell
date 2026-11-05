@@ -133,6 +133,8 @@ if [[ -z "$DOCKER_SOCKET" || "$DOCKER_SOCKET" == *://* || ! -S "$DOCKER_SOCKET" 
   echo "FAIL the Docker context does not expose a local Unix socket (got '${DOCKER_SOCKET:-none}')" >&2
   exit 1
 fi
+docker info --format '{{.ID}}' >/dev/null \
+  || { echo "FAIL the Docker daemon at $DOCKER_SOCKET is not reachable" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Working directory, ports, cleanup
@@ -140,6 +142,7 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ans-openshell-smoke.XXXXXX")"
 LOG_DIR="$WORK/logs"
 FIXTURES="$WORK/fixtures"
+BIN="$WORK/bin"
 # Every OpenShell path (config, state, CLI gateway registrations) lives under
 # WORK so the run never touches a real installation.
 export XDG_CONFIG_HOME="$WORK/xdg/config"
@@ -147,13 +150,15 @@ export XDG_STATE_HOME="$WORK/xdg/state"
 export XDG_DATA_HOME="$WORK/xdg/data"
 export OPENSHELL_LOCAL_TLS_DIR="$WORK/gateway-tls"
 unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_SANDBOX_POLICY OPENSHELL_COMPUTE_DRIVER OPENSHELL_DRIVERS
-mkdir -p "$LOG_DIR" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
+mkdir -p "$LOG_DIR" "$BIN" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 
 RUN_ID="ans-smoke-$$-$RANDOM"
 MIDDLEWARE_NAME="ans-identity-smoke"
-# Docker namespace for everything the gateway creates; stable across runs on
-# purpose, see write_gateway_config.
-DOCKER_SANDBOX_LABEL="ans-openshell-smoke"
+# Docker namespace for everything the gateway creates. One per run, so two runs
+# on one daemon never reach each other's sandboxes (see write_gateway_config);
+# the pid lets reclaim_dead_runs tell a dead run's leftovers from a live run's.
+DOCKER_SANDBOX_LABEL_PREFIX="ans-openshell-smoke-"
+DOCKER_SANDBOX_LABEL="$DOCKER_SANDBOX_LABEL_PREFIX$$"
 # The workload image is tagged by its Dockerfile's checksum so repeated runs
 # reuse the build and a Dockerfile change forces a new one.
 WORKLOAD_IMAGE="ans-openshell-smoke-workload:$(cksum "$EXAMPLE_DIR/workload/Dockerfile" | awk '{ print $1 }')"
@@ -170,49 +175,141 @@ declare -a CLI=()
 sandbox_containers() {
   local name
   for name in ${CREATED_SANDBOXES[@]+"${CREATED_SANDBOXES[@]}"}; do
-    docker ps -aq --filter "label=openshell.ai/sandbox-namespace=$DOCKER_SANDBOX_LABEL" \
+    run_bounded 30 docker ps -aq --filter "label=openshell.ai/sandbox-namespace=$DOCKER_SANDBOX_LABEL" \
       --filter "label=openshell.ai/sandbox-name=$name" 2>/dev/null
   done | tr '\n' ' '
+}
+
+# capture_container_logs saves the stdout and stderr of every container the
+# driver created for this run's sandboxes. The supervisor's log is the only
+# place a middleware_failed verdict explains itself (TLS handshake, connect
+# timeout, JWT audience), and cleanup destroys those containers.
+capture_container_logs() {
+  local id name
+  for id in $(sandbox_containers); do
+    name="$(run_bounded 10 docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||' || true)"
+    run_bounded 30 docker logs "$id" >"$LOG_DIR/container-${name:-$id}.log" 2>&1 || true
+  done
+}
+
+# label_resources prints "KIND ID LABEL" for every container and volume the
+# Docker driver created under any sandbox namespace, running or exited. Like
+# every Docker call on the teardown path it is bounded, so a wedged daemon
+# cannot keep cleanup from reaching the key removal.
+label_resources() {
+  run_bounded 30 docker ps -a --filter label=openshell.ai/sandbox-namespace \
+    --format 'container {{.ID}} {{.Label "openshell.ai/sandbox-namespace"}}'
+  run_bounded 30 docker volume ls --filter label=openshell.ai/sandbox-namespace \
+    --format 'volume {{.Name}} {{.Label "openshell.ai/sandbox-namespace"}}'
+}
+
+# remove_resources force-removes the "KIND ID LABEL" lines it reads on stdin.
+remove_resources() {
+  local kind id _label
+  while read -r kind id _label; do
+    run_bounded 30 docker "$kind" rm -f "$id" >>"$LOG_DIR/setup.log" 2>&1 || true
+  done
+}
+
+# reclaim_dead_runs removes what earlier runs that died before their own
+# cleanup left on the daemon: everything under a harness label whose pid no
+# longer runs. A label whose pid is alive is a run in progress and is left
+# alone; its gateway never sees this run's label either.
+reclaim_dead_runs() {
+  local kind id label pid stale=""
+  while read -r kind id label; do
+    [[ "$label" == "$DOCKER_SANDBOX_LABEL_PREFIX"* ]] || continue
+    pid="${label#"$DOCKER_SANDBOX_LABEL_PREFIX"}"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    ps -p "$pid" -o pid= >/dev/null 2>&1 && continue
+    stale+="$kind $id $label"$'\n'
+  done < <(label_resources)
+  [[ -n "$stale" ]] || return 0
+  echo "WARN removing what earlier smoke runs left on the daemon:" >&2
+  printf '%s' "$stale" | awk '{ print "WARN   " $1 " " $2 " (" $3 ")" }' >&2
+  printf '%s' "$stale" | remove_resources
+}
+
+# run_bounded SECONDS CMD...: runs CMD with a wall-clock deadline so a stalled
+# registry pull or a hung RPC becomes a failure with logs instead of a hang.
+# Uses coreutils timeout where present (Linux; gtimeout from Homebrew coreutils)
+# and a background watchdog otherwise (stock macOS). The watchdog's output goes
+# nowhere: inside "$(run_bounded ...)" it would otherwise hold the capture pipe
+# open until its sleep ends, and a command that finished at once would not
+# return to the caller before the whole deadline had passed.
+run_bounded() {
+  local seconds="$1" timeout_cmd
+  shift
+  for timeout_cmd in timeout gtimeout; do
+    if command -v "$timeout_cmd" >/dev/null 2>&1; then
+      "$timeout_cmd" "$seconds" "$@"
+      return
+    fi
+  done
+  "$@" &
+  local pid=$!
+  (
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+    sleep "$seconds" &
+    sleeper=$!
+    wait "$sleeper"
+    kill "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  local watchdog=$!
+  local status=0
+  wait "$pid" || status=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$status"
+}
+
+# stop_process PID sends TERM, allows ten seconds, then KILLs what is left.
+stop_process() {
+  kill "$1" 2>/dev/null || true
+  for _ in {1..100}; do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
 }
 
 cleanup() {
   local status=$?
   trap - EXIT
+  # Everything below runs whatever fails along the way, the Docker daemon
+  # included, and a second Ctrl-C does not cut it short: every step is
+  # bounded, and the minted keys are removed last.
+  set +e
+  trap '' INT
   # fail already captured the container logs on an assertion failure; this
   # covers a Ctrl-C or an unexpected exit, before the sandboxes go away.
   [[ $status -eq 0 ]] || capture_container_logs
   if [[ ${#CLI[@]} -gt 0 ]]; then
     for name in ${CREATED_SANDBOXES[@]+"${CREATED_SANDBOXES[@]}"}; do
-      "${CLI[@]}" sandbox delete "$name" >>"$LOG_DIR/setup.log" 2>&1 || true
+      run_bounded 60 "${CLI[@]}" sandbox delete "$name" >>"$LOG_DIR/setup.log" 2>&1
     done
-    # The gateway removes a sandbox's containers in a background task after
-    # the delete RPC returns, and stopping a supervisor can take ten seconds or
-    # more. Wait for the driver to finish before taking the gateway down, and
-    # remove anything it did not get to so nothing accumulates on the daemon.
-    local leftover
-    for _ in {1..120}; do
-      leftover="$(sandbox_containers)"
-      [[ -z "$leftover" ]] && break
+    # The gateway removes a sandbox's containers, then its volumes, in a
+    # background task after the delete RPC returns, and stopping a supervisor
+    # can take ten seconds or more. Give the driver up to a minute before
+    # taking the gateway down; whatever it did not get to is removed below.
+    local deadline=$((SECONDS + 60))
+    while ((SECONDS < deadline)); do
+      kill -0 "$GATEWAY_PID" 2>/dev/null || break
+      [[ -z "$(sandbox_containers)" ]] && break
       sleep 0.5
     done
-    if [[ -n "$leftover" ]]; then
-      echo "WARN removing containers the gateway had not finished deleting" >&2
-      # shellcheck disable=SC2086 # container ids are whitespace-separated
-      docker rm -f $leftover >>"$LOG_DIR/setup.log" 2>&1 || true
-    fi
   fi
   for pid in "$GATEWAY_PID" "$MIDDLEWARE_PID" "$CALLEE_PID"; do
-    if [[ -n "$pid" ]]; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
+    [[ -z "$pid" ]] || stop_process "$pid"
   done
-  if [[ $status -eq 0 ]]; then
+  label_resources | awk -v label="$DOCKER_SANDBOX_LABEL" '$3 == label' | remove_resources
+  if [[ $status -eq 0 || -z "$(ls -A "$LOG_DIR" 2>/dev/null)" ]]; then
     rm -rf "$WORK"
   else
     # Keep the logs for diagnosis, never the minted private keys, the gateway
     # database or the CLI client certificate.
-    rm -rf "$FIXTURES" "$OPENSHELL_LOCAL_TLS_DIR" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$BIN" "$WORK"/gateway.db*
+    rm -rf "$FIXTURES" "$OPENSHELL_LOCAL_TLS_DIR" "$WORK/xdg" "$BIN" "$WORK"/gateway.db*
     echo "logs retained in $LOG_DIR" >&2
   fi
   exit "$status"
@@ -253,18 +350,6 @@ GATEWAY_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT"
 # and the callee verifies against it (pop trusted host).
 CALLEE_AUTHORITY="host.openshell.internal:$CALLEE_PORT"
 
-# capture_container_logs saves the stdout and stderr of every container the
-# driver created for this run's sandboxes. The supervisor's log is the only
-# place a middleware_failed verdict explains itself (TLS handshake, connect
-# timeout, JWT audience), and cleanup destroys those containers.
-capture_container_logs() {
-  local id name
-  for id in $(sandbox_containers); do
-    name="$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||')"
-    docker logs "$id" >"$LOG_DIR/container-${name:-$id}.log" 2>&1 || true
-  done
-}
-
 fail() {
   printf 'FAIL %s\n' "$1" >&2
   capture_container_logs
@@ -274,28 +359,6 @@ fail() {
     tail -n 60 "$log" >&2
   done
   exit 1
-}
-
-# run_bounded SECONDS CMD...: runs CMD with a wall-clock deadline so a stalled
-# registry pull or a hung RPC becomes a failure with logs instead of a hang.
-# Uses coreutils timeout where present (Linux, Homebrew coreutils) and a
-# background watchdog otherwise (stock macOS).
-run_bounded() {
-  local seconds="$1"
-  shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-    return
-  fi
-  "$@" &
-  local pid=$!
-  ( sleep "$seconds" && kill "$pid" 2>/dev/null ) &
-  local watchdog=$!
-  local status=0
-  wait "$pid" || status=$?
-  kill "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
-  return "$status"
 }
 
 step() {
@@ -340,15 +403,16 @@ CACHE="${ANS_SMOKE_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/ans-openshell-smoke}
 mkdir -p "$CACHE"
 
 # fetch_asset NAME SHA BINARY: downloads the release tarball once, verifies it
-# against the pinned digest, and extracts BINARY into the cache. Everything it
-# prints goes to stderr so the callers below can read nothing but the binary
-# path from stdout.
+# against the pinned digest, and extracts BINARY into the run directory.
+# Everything it prints goes to stderr so the callers below can read nothing
+# but the binary path from stdout.
 fetch_asset() {
   local name="$1" sha="$2" bin="$BIN/$3"
   local dest="$CACHE/$name.tar.gz"
   if [[ ! -f "$dest" ]]; then
     printf 'INFO downloading %s %s\n' "$OPENSHELL_VERSION" "$name" >&2
-    curl -fsSL --retry 3 -o "$dest.partial" \
+    curl -fsSL --retry 3 --retry-max-time 600 --connect-timeout 15 \
+      --speed-limit 1024 --speed-time 30 --max-time 600 -o "$dest.partial" \
       "https://github.com/NVIDIA/OpenShell/releases/download/$OPENSHELL_VERSION/$name.tar.gz"
     mv "$dest.partial" "$dest"
   fi
@@ -363,8 +427,6 @@ fetch_asset() {
   printf '%s\n' "$bin"
 }
 
-BIN="$WORK/bin"
-mkdir -p "$BIN"
 CLI_BIN="$(fetch_asset "$CLI_ASSET" "$CLI_SHA" openshell)"
 GATEWAY_BIN="$(fetch_asset "$GW_ASSET" "$GW_SHA" openshell-gateway)"
 [[ -x "$CLI_BIN" && -x "$GATEWAY_BIN" ]] || fail "release binaries are not executable: $CLI_BIN $GATEWAY_BIN"
@@ -432,8 +494,8 @@ compute_driver = "docker"
 # gateway, middleware and callee all listen on; host.openshell.internal in the
 # sandbox resolves to the same address. The sandbox_label scopes the gateway's
 # startup reconciliation, which removes every supervisor container in its
-# label, to this harness: an OpenShell install sharing the daemon keeps its
-# sandboxes, and a crashed smoke run's leftovers are reclaimed by the next one.
+# label, to this run: an OpenShell install sharing the daemon keeps its
+# sandboxes, and so does a concurrent smoke run, which has a label of its own.
 [openshell.drivers.docker]
 socket_path = "$DOCKER_SOCKET"
 grpc_endpoint = "https://$SERVICE_HOST:$GATEWAY_PORT"
@@ -473,6 +535,7 @@ render_policy() {
     "$EXAMPLE_DIR/policy.template.yaml" >"$WORK/policy.yaml"
 }
 render_policy
+reclaim_dead_runs
 
 # ---------------------------------------------------------------------------
 # Start the callee, the middleware, then the gateway
@@ -493,8 +556,7 @@ start_middleware() {
 }
 
 stop_middleware() {
-  kill "$MIDDLEWARE_PID" 2>/dev/null || true
-  wait "$MIDDLEWARE_PID" 2>/dev/null || true
+  stop_process "$MIDDLEWARE_PID"
   MIDDLEWARE_PID=""
   for _ in {1..30}; do
     port_is_free "$MIDDLEWARE_PORT" && return
