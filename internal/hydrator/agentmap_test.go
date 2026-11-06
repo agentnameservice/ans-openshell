@@ -73,8 +73,14 @@ func TestAgentMapLookup(t *testing.T) {
 		name      string
 		m         AgentMap
 		container *Container
+		device    *Device
 		wantID    string
 	}{
+		{name: "by device container uid", m: m, device: &Device{Container: &Container{UID: "u-a"}}, wantID: "a"},
+		{name: "by device container name", m: m, device: &Device{Container: &Container{Name: "n-b"}}, wantID: "b"},
+		{name: "device container wins over top-level", m: m, device: &Device{Container: &Container{UID: "u-a"}}, container: &Container{Name: "n-b"}, wantID: "a"},
+		{name: "unknown device container", m: m, device: &Device{Container: &Container{UID: "x"}}, container: &Container{Name: "n-b"}},
+		{name: "device without container", m: m, device: &Device{}, container: &Container{Name: "n-b"}, wantID: "b"},
 		{name: "by uid", m: m, container: &Container{UID: "u-a", Name: "renamed"}, wantID: "a"},
 		{name: "by name when uid unknown", m: m, container: &Container{UID: "other", Name: "n-a"}, wantID: "a"},
 		{name: "uid wins over another agent's name", m: m, container: &Container{UID: "u-a", Name: "n-b"}, wantID: "a"},
@@ -87,7 +93,7 @@ func TestAgentMapLookup(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, ok := tt.m.Lookup(Event{Container: tt.container})
+			got, ok := tt.m.Lookup(Event{Device: tt.device, Container: tt.container})
 			if ok != (tt.wantID != "") {
 				t.Fatalf("Lookup() ok = %v, want %v", ok, tt.wantID != "")
 			}

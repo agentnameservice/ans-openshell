@@ -88,6 +88,36 @@ func jsonLine(t *testing.T, fields map[string]any) string {
 	return string(b)
 }
 
+// moveSandboxToDevice rewrites the records on lines selected by move to carry
+// their sandbox in device.container, the shape OpenShell emits after v0.1.7.
+// Lines without a JSON object or without a container are left untouched.
+func moveSandboxToDevice(t *testing.T, input string, move func(line string) bool) string {
+	t.Helper()
+	lines := strings.Split(input, "\n")
+	for i, line := range lines {
+		start := strings.IndexByte(line, '{')
+		if start < 0 || !move(line) {
+			continue
+		}
+		fields := exampleFields(t, line[start:])
+		container, ok := fields["container"]
+		if !ok {
+			continue
+		}
+		delete(fields, "container")
+		device, _ := fields["device"].(map[string]any)
+		if device == nil {
+			device = map[string]any{}
+		}
+		device["container"] = container
+		fields["device"] = device
+		lines[i] = line[:start] + jsonLine(t, fields)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func everyLine(string) bool { return true }
+
 func exampleFields(t *testing.T, example string) map[string]any {
 	t.Helper()
 	var fields map[string]any
