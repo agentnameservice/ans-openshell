@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/agentnameservice/ans-openshell/compare/v0.1.1...v0.1.2) (2026-11-06)
+
+
+### Bug Fixes
+
+* **hydrator:** read sandbox identity from device.container ([#24](https://github.com/agentnameservice/ans-openshell/issues/24)) ([b9ac477](https://github.com/agentnameservice/ans-openshell/commit/b9ac477c0b78c339395b297deededa80b311a34a)), closes [#23](https://github.com/agentnameservice/ans-openshell/issues/23)
+
 ## [0.1.1](https://github.com/agentnameservice/ans-openshell/compare/v0.1.0...v0.1.1) (2026-11-05)
 
 
