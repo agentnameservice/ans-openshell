@@ -79,6 +79,8 @@ archives:
     formats: [tar.gz]
     files:
       - LICENSE
+      - LICENSES/MIT.txt
+      - NOTICE
       - README.md
       - third_party/openshell/LICENSE
       - third_party/openshell/README.md
