@@ -20,33 +20,47 @@
 # The in-process demo (make demo) covers replay and body tampering; this script
 # covers what only a real runtime can show: that OpenShell invokes the service,
 # applies its header mutations, and blocks traffic when it is down.
+#
+# --with-trust-index adds five checks from trust-index.sh: the run's policy
+# decisions are exported as OCSF records, scored by the hydrator and imported
+# into a pinned agent-trust-discovery, which lists the score on the agent.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXAMPLE_DIR="$ROOT/examples/openshell-smoke"
 KEEP_RUNNING=0
 PRINT_CONFIG=0
+WITH_TRUST_INDEX=0
 
 usage() {
   cat <<USAGE
-usage: $0 [--keep-running] [--print-config]
+usage: $0 [--keep-running] [--print-config] [--with-trust-index]
 
 Builds the extension, downloads the pinned OpenShell release, starts a local
 gateway with the ANS middleware registered, creates a sandbox, and runs the
 identity assertions. Exits non-zero when any assertion fails.
 
 Options:
-  --keep-running   After the assertions pass, leave the stack up for
-                   interactive use until Ctrl-C.
-  --print-config   Print the rendered gateway configuration and exit.
-  -h, --help       Show this help.
+  --keep-running      After the assertions pass, leave the stack up for
+                      interactive use until Ctrl-C.
+  --print-config      Print the rendered gateway configuration and exit.
+  --with-trust-index  Also export the run's OCSF records, score them with the
+                      hydrator and import the score into a pinned
+                      agent-trust-discovery (see trust-index.sh).
+  -h, --help          Show this help.
 
 Environment:
   ANS_SMOKE_HOST      Non-loopback IPv4 address of this machine that sandbox
                       containers can reach. Detected when unset.
   ANS_SMOKE_CACHE     Where OpenShell release assets are cached.
                       Default: \${XDG_CACHE_HOME:-\$HOME/.cache}/ans-openshell-smoke
-  ANS_SMOKE_LOG_LEVEL Gateway log level (default: info).
+  ANS_SMOKE_LOG_LEVEL Gateway log level (default: info). The Docker driver
+                      forwards it to the supervisors, whose console queue is
+                      lossy and carries the OCSF records --with-trust-index
+                      counts, so that flag refuses debug and trace.
+  ANS_SMOKE_TRUST_INDEX_LOG_LEVEL
+                      Log level of the Trust Index and the hydrator under
+                      --with-trust-index (default: info).
 USAGE
 }
 
@@ -54,6 +68,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-running) KEEP_RUNNING=1 ;;
     --print-config) PRINT_CONFIG=1 ;;
+    --with-trust-index) WITH_TRUST_INDEX=1 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -62,6 +77,14 @@ done
 
 # shellcheck source=examples/openshell-smoke/openshell-release.env
 source "$EXAMPLE_DIR/openshell-release.env"
+if [[ $WITH_TRUST_INDEX -eq 1 ]]; then
+  if [[ "${ANS_SMOKE_LOG_LEVEL:-info}" =~ ^(debug|trace)$ ]]; then
+    echo "FAIL --with-trust-index needs ANS_SMOKE_LOG_LEVEL=info or quieter: the supervisor's console queue is lossy and carries the OCSF records check 8 counts" >&2
+    exit 2
+  fi
+  # shellcheck source=examples/openshell-smoke/trust-index.sh
+  source "$EXAMPLE_DIR/trust-index.sh"
+fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "FAIL missing required command: $1" >&2; exit 1; }
@@ -300,16 +323,18 @@ cleanup() {
       sleep 0.5
     done
   fi
-  for pid in "$GATEWAY_PID" "$MIDDLEWARE_PID" "$CALLEE_PID"; do
+  for pid in "$GATEWAY_PID" "$MIDDLEWARE_PID" "$CALLEE_PID" "${TRUST_INDEX_PID:-}"; do
     [[ -z "$pid" ]] || stop_process "$pid"
   done
   label_resources | awk -v label="$DOCKER_SANDBOX_LABEL" '$3 == label' | remove_resources
   if [[ $status -eq 0 || -z "$(ls -A "$LOG_DIR" 2>/dev/null)" ]]; then
     rm -rf "$WORK"
   else
-    # Keep the logs for diagnosis, never the minted private keys, the gateway
-    # database or the CLI client certificate.
-    rm -rf "$FIXTURES" "$OPENSHELL_LOCAL_TLS_DIR" "$WORK/xdg" "$BIN" "$WORK"/gateway.db*
+    # Keep the logs for diagnosis and nothing else: the minted private keys,
+    # the gateway database, the CLI client certificate and whatever a sourced
+    # extension put under WORK all go. Anything worth keeping is written under
+    # LOG_DIR by the code that produces it.
+    find "$WORK" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
     echo "logs retained in $LOG_DIR" >&2
   fi
   exit "$status"
@@ -339,12 +364,13 @@ choose_port_block() {
   exit 1
 }
 
-PORT_BASE="$(choose_port_block 5)"
+PORT_BASE="$(choose_port_block $((5 + WITH_TRUST_INDEX)))"
 MIDDLEWARE_PORT="$PORT_BASE"
 MIDDLEWARE_HEALTH_PORT="$((PORT_BASE + 1))"
 CALLEE_PORT="$((PORT_BASE + 2))"
 GATEWAY_PORT="$((PORT_BASE + 3))"
 GATEWAY_HEALTH_PORT="$((PORT_BASE + 4))"
+[[ $WITH_TRUST_INDEX -eq 0 ]] || TRUST_INDEX_PORT="$((PORT_BASE + 5))"
 GATEWAY_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT"
 # The sandbox dials the callee by this authority; the middleware signs for it
 # and the callee verifies against it (pop trusted host).
@@ -354,7 +380,8 @@ fail() {
   printf 'FAIL %s\n' "$1" >&2
   capture_container_logs
   local log
-  for log in "$LOG_DIR"/*.log; do
+  for log in "$LOG_DIR"/*.log "$LOG_DIR"/*.jsonl; do
+    [[ -f "$log" ]] || continue
     printf '\n--- %s ---\n' "$log" >&2
     tail -n 60 "$log" >&2
   done
@@ -399,22 +426,26 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "FAIL unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
-CACHE="${ANS_SMOKE_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/ans-openshell-smoke}/$OPENSHELL_VERSION"
+CACHE_ROOT="${ANS_SMOKE_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/ans-openshell-smoke}"
+CACHE="$CACHE_ROOT/$OPENSHELL_VERSION"
 mkdir -p "$CACHE"
 
-# fetch_asset NAME SHA BINARY: downloads the release tarball once, verifies it
-# against the pinned digest, and extracts BINARY into the run directory.
-# Everything it prints goes to stderr so the callers below can read nothing
-# but the binary path from stdout.
-fetch_asset() {
-  local name="$1" sha="$2" bin="$BIN/$3"
-  local dest="$CACHE/$name.tar.gz"
+# fetch_release_asset BASE_URL VERSION CACHE_DIR NAME SHA BINARY: downloads the
+# release tarball BASE_URL/VERSION/NAME.tar.gz once into CACHE_DIR, verifies it
+# against the pinned digest, and extracts BINARY into the run directory. The
+# download lands in a per-run partial file so two cold-cache runs cannot
+# corrupt each other's copy. Everything it prints goes to stderr so the callers
+# below can read nothing but the binary path from stdout.
+fetch_release_asset() {
+  local base_url="$1" version="$2" cache_dir="$3" name="$4" sha="$5" bin="$BIN/$6"
+  local dest="$cache_dir/$name.tar.gz"
+  mkdir -p "$cache_dir"
   if [[ ! -f "$dest" ]]; then
-    printf 'INFO downloading %s %s\n' "$OPENSHELL_VERSION" "$name" >&2
+    printf 'INFO downloading %s %s\n' "$version" "$name" >&2
     curl -fsSL --retry 3 --retry-max-time 600 --connect-timeout 15 \
-      --speed-limit 1024 --speed-time 30 --max-time 600 -o "$dest.partial" \
-      "https://github.com/NVIDIA/OpenShell/releases/download/$OPENSHELL_VERSION/$name.tar.gz"
-    mv "$dest.partial" "$dest"
+      --speed-limit 1024 --speed-time 30 --max-time 600 -o "$dest.partial.$$" \
+      "$base_url/$version/$name.tar.gz" || { rm -f "$dest.partial.$$"; fail "download of $name failed"; }
+    mv "$dest.partial.$$" "$dest"
   fi
   if ! sha256_matches "$sha" "$dest"; then
     rm -f "$dest"
@@ -422,9 +453,13 @@ fetch_asset() {
   fi
   # The binary is extracted from the verified tarball on every run, into the
   # run's own directory, so what executes is always what the checksum covered.
-  tar -xzf "$dest" -C "$BIN" "$3"
+  tar -xzf "$dest" -C "$BIN" "$6"
   chmod 0755 "$bin"
   printf '%s\n' "$bin"
+}
+
+fetch_asset() {
+  fetch_release_asset "https://github.com/NVIDIA/OpenShell/releases/download" "$OPENSHELL_VERSION" "$CACHE" "$@"
 }
 
 CLI_BIN="$(fetch_asset "$CLI_ASSET" "$CLI_SHA" openshell)"
@@ -435,7 +470,14 @@ printf 'INFO openshell %s\n' "$("$CLI_BIN" --version 2>&1 | head -n 1)"
 # ---------------------------------------------------------------------------
 # Build the extension and mint the fixtures
 # ---------------------------------------------------------------------------
-step "building the extension" go build -C "$ROOT" -o "$BIN/" ./cmd/ans-openshell-middleware ./cmd/ans-reference-callee ./examples/openshell-smoke/fixtures
+BUILD_PACKAGES=(./cmd/ans-openshell-middleware ./cmd/ans-reference-callee ./examples/openshell-smoke/fixtures)
+if [[ $WITH_TRUST_INDEX -eq 1 ]]; then
+  BUILD_PACKAGES+=(./cmd/ans-ocsf-hydrator)
+  TRUST_INDEX_BIN="$(fetch_release_asset "https://github.com/agentnameservice/agent-trust-discovery/releases/download" \
+    "$TRUST_INDEX_VERSION" "$CACHE_ROOT/trust-index/$TRUST_INDEX_VERSION" "$TRUST_INDEX_ASSET" "$TRUST_INDEX_SHA" agent-trust-discovery)"
+  [[ -x "$TRUST_INDEX_BIN" ]] || fail "release binary is not executable: $TRUST_INDEX_BIN"
+fi
+step "building the extension" go build -C "$ROOT" -o "$BIN/" "${BUILD_PACKAGES[@]}"
 step "minting fixtures" "$BIN/fixtures" -out "$FIXTURES" -middleware-host "$SERVICE_HOST"
 if ! docker image inspect "$WORKLOAD_IMAGE" >/dev/null 2>&1; then
   step "building the workload image $WORKLOAD_IMAGE" run_bounded 600 docker build -q -t "$WORKLOAD_IMAGE" "$EXAMPLE_DIR/workload"
@@ -525,8 +567,15 @@ TOML
 
 write_gateway_config
 write_middleware_config "{}"
+[[ $WITH_TRUST_INDEX -eq 0 ]] || trust_index_prepare
 if [[ $PRINT_CONFIG -eq 1 ]]; then
   cat "$WORK/gateway.toml" "$WORK/middleware.yaml"
+  if [[ $WITH_TRUST_INDEX -eq 1 ]]; then
+    # The sandbox id only exists once the sandbox does; a placeholder stands
+    # in for it so the printed file is valid YAML.
+    write_hydrator_config "00000000-0000-0000-0000-000000000000"
+    trust_index_print_config
+  fi
   exit 0
 fi
 
@@ -565,6 +614,7 @@ stop_middleware() {
   fail "middleware port did not close"
 }
 
+[[ $WITH_TRUST_INDEX -eq 0 ]] || trust_index_start
 start_callee
 # The callee has no health route; its first signed request is the readiness check.
 for _ in {1..30}; do
@@ -589,6 +639,7 @@ middleware_negotiated() {
     | jq -e --arg name "$MIDDLEWARE_NAME" '.extensions[] | select(.configured_name == $name)' >/dev/null
 }
 step "verifying the gateway negotiated the middleware" middleware_negotiated
+[[ $WITH_TRUST_INDEX -eq 0 ]] || trust_index_enable_export
 
 # ---------------------------------------------------------------------------
 # Sandboxes
@@ -608,6 +659,11 @@ create_sandbox() {
 sandbox_curl() {
   local name="$1"
   shift
+  # Every request is journaled, one line per call, so a failure shows what the
+  # sandboxes were asked to do. A file rather than a counter because callers
+  # run this inside a command substitution, where a variable never reaches
+  # the parent shell.
+  printf '%s %s\n' "$name" "$*" >>"$LOG_DIR/requests.log"
   run_bounded 90 "${CLI[@]}" sandbox exec --name "$name" --no-tty -- \
     curl -sS --max-time 20 -w '\n%{http_code}' "$@" "http://$CALLEE_AUTHORITY/v1/tasks" \
     -H 'content-type: application/json' --data '{"task":"settle invoice 42"}'
@@ -622,17 +678,19 @@ SANDBOX_ID="$(create_sandbox "$SANDBOX_NAME")"
 [[ -n "$SANDBOX_ID" && "$SANDBOX_ID" != null ]] || fail "could not read the sandbox id"
 printf 'INFO sandbox %s has id %s\n' "$SANDBOX_NAME" "$SANDBOX_ID"
 
-# Approve exactly this sandbox for the identity; the operator-owned map is
-# the only thing that grants signing.
-write_middleware_config "{$SANDBOX_ID: $IDENTITY}"
-stop_middleware
-start_middleware
-
 PASS=0
 check() {
   printf 'PASS %s\n' "$1"
   PASS=$((PASS + 1))
 }
+
+[[ $WITH_TRUST_INDEX -eq 0 ]] || trust_index_check_export_live
+
+# Approve exactly this sandbox for the identity; the operator-owned map is
+# the only thing that grants signing.
+write_middleware_config "{$SANDBOX_ID: $IDENTITY}"
+stop_middleware
+start_middleware
 
 # 1. Authorized sandbox: the callee returns the assigned identity. The
 # middleware was just restarted to approve the sandbox, and the supervisor's
@@ -701,7 +759,16 @@ grep -q 'middleware_failed' <<<"$BODY" || fail "middleware down: not a middlewar
 check "request is blocked while the middleware is unavailable (fail_closed)"
 start_middleware
 
-printf 'ALL PASS %d checks against OpenShell %s (%s)\n' "$PASS" "$OPENSHELL_VERSION" "${OPENSHELL_COMMIT:0:7}"
+if [[ $WITH_TRUST_INDEX -eq 1 ]]; then
+  trust_index_check_policy_denied
+  trust_index_check_records
+  trust_index_check_hydrator
+  trust_index_check_readback
+  printf 'ALL PASS %d checks against OpenShell %s (%s) and %s\n' \
+    "$PASS" "$OPENSHELL_VERSION" "${OPENSHELL_COMMIT:0:7}" "$(trust_index_summary)"
+else
+  printf 'ALL PASS %d checks against OpenShell %s (%s)\n' "$PASS" "$OPENSHELL_VERSION" "${OPENSHELL_COMMIT:0:7}"
+fi
 
 if [[ $KEEP_RUNNING -eq 1 ]]; then
   cat <<EOT
@@ -715,6 +782,8 @@ READY the stack stays up until Ctrl-C.
 Signed request from the sandbox:
   XDG_CONFIG_HOME=$XDG_CONFIG_HOME $CLI_BIN --gateway smoke sandbox exec --name $SANDBOX_NAME --no-tty -- curl -sS http://$CALLEE_AUTHORITY/v1/tasks -H 'content-type: application/json' --data '{"task":"hello"}'
 EOT
-  while kill -0 "$GATEWAY_PID" 2>/dev/null && kill -0 "$MIDDLEWARE_PID" 2>/dev/null; do sleep 1; done
+  [[ $WITH_TRUST_INDEX -eq 0 ]] || trust_index_print_ready
+  while kill -0 "$GATEWAY_PID" 2>/dev/null && kill -0 "$MIDDLEWARE_PID" 2>/dev/null \
+    && { [[ -z "${TRUST_INDEX_PID:-}" ]] || kill -0 "$TRUST_INDEX_PID" 2>/dev/null; }; do sleep 1; done
   fail "a process exited"
 fi

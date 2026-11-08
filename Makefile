@@ -5,7 +5,7 @@ LINT_GOTOOLCHAIN ?= local
 BIN := bin
 CMDS := ans-openshell-middleware ans-openshell-interceptor ans-ocsf-hydrator ans-reference-callee
 
-.PHONY: all build proto test cover lint vet demo openshell-smoke clean
+.PHONY: all build proto test cover lint vet demo openshell-smoke openshell-smoke-trust-index clean
 
 all: build
 
@@ -48,3 +48,8 @@ clean:
 # End-to-end check against a real OpenShell gateway (Docker). See examples/openshell-smoke/README.md.
 openshell-smoke:
 	examples/openshell-smoke/smoke.sh
+
+# The same run, then its OCSF records scored by the hydrator and imported into a pinned
+# agent-trust-discovery. See "Scoring the run's behavior" in the same README.
+openshell-smoke-trust-index:
+	examples/openshell-smoke/smoke.sh --with-trust-index
