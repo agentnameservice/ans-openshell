@@ -1,7 +1,9 @@
 # Runs the extension against the pinned OpenShell release with a real gateway,
-# supervisor and sandbox on the Docker driver. Slower than the unit suite and
-# dependent on GitHub's Docker daemon and ghcr.io, so it runs on pushes to main,
-# on pull requests that touch what it exercises, and on demand.
+# supervisor and sandbox on the Docker driver, once for the identity checks and
+# once with the run's behavior scored into a pinned agent-trust-discovery.
+# Slower than the unit suite and dependent on GitHub's Docker daemon and
+# ghcr.io, so it runs on pushes to main, on pull requests that touch what it
+# exercises, and on demand. Neither job is a required status check.
 name: OpenShell smoke
 
 on:
@@ -12,7 +14,10 @@ on:
     paths:
       - "cmd/ans-openshell-middleware/**"
       - "cmd/ans-reference-callee/**"
+      - "cmd/ans-ocsf-hydrator/**"
       - "internal/**"
+      - "pkg/**"
+      - "deploy/examples/trust-index-score-signals.yaml"
       - "gen/**"
       - "third_party/openshell/**"
       - "examples/openshell-smoke/**"
@@ -27,34 +32,49 @@ permissions:
 
 jobs:
   smoke:
-    name: Gateway, supervisor and sandbox on Docker
+    name: ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [openshell-smoke, openshell-smoke-trust-index]
+        include:
+          # The gateway runs at debug so a middleware_failed verdict on CI
+          # explains itself; smoke.sh refuses debug under --with-trust-index
+          # (see its usage text), so that run stays at info.
+          - target: openshell-smoke
+            log_level: debug
+          - target: openshell-smoke-trust-index
+            log_level: info
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e #v7.0.0
         with:
           go-version: "1.26.9"
-      - name: Cache OpenShell release assets
+      - name: Cache release assets
+        # Keyed per target: the two jobs cache different asset sets, and a shared
+        # key would be saved by whichever job finished first and never refilled.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 #v4.3.0
         with:
           path: ~/.cache/ans-openshell-smoke
-          key: openshell-${{ hashFiles('examples/openshell-smoke/openshell-release.env') }}-${{ runner.os }}-${{ runner.arch }}
+          key: ${{ matrix.target }}-${{ hashFiles('examples/openshell-smoke/*-release.env') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Run the smoke test
         # A fixed TMPDIR makes the retained log directory addressable by the
-        # upload step below; the gateway runs at debug so a middleware_failed
-        # verdict on CI explains itself.
+        # upload step below.
         env:
           TMPDIR: ${{ runner.temp }}/smoke
-          ANS_SMOKE_LOG_LEVEL: debug
+          ANS_SMOKE_LOG_LEVEL: ${{ matrix.log_level }}
         run: |
           mkdir -p "$TMPDIR"
-          make openshell-smoke
+          make ${{ matrix.target }}
       - name: Upload retained logs
-        if: failure()
+        # Also on cancellation, so a run cut off by timeout-minutes still
+        # leaves its logs behind.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
-          name: openshell-smoke-logs
+          name: ${{ matrix.target }}-logs
           path: ${{ runner.temp }}/smoke/ans-openshell-smoke.*/logs/
           if-no-files-found: ignore
           retention-days: 7
