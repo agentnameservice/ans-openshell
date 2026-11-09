@@ -3,7 +3,7 @@ module github.com/agentnameservice/ans-openshell
 go 1.26.0
 
 require (
-	github.com/agentnameservice/ans-sdk-go v0.1.20
+	github.com/agentnameservice/ans-sdk-go v0.2.0
 	github.com/fxamacker/cbor/v2 v2.10.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
