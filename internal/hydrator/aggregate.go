@@ -142,7 +142,7 @@ func (a *attributor) add(ev Event) {
 	mapping, ok := a.agents.Lookup(ev)
 	if !ok {
 		a.unmapped++
-		if ev.Container == nil {
+		if ev.Sandbox() == nil {
 			a.noContainer++
 		}
 		return

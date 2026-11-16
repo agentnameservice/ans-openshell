@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -153,6 +155,109 @@ func TestRunEndToEnd(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("logs missing %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+func TestRunDeviceContainerShape(t *testing.T) {
+	t.Parallel()
+	run := func(t *testing.T, input string) (Report, []byte) {
+		t.Helper()
+		sink := &fakeSink{}
+		opts := Options{Agents: sampleAgents(t), Signals: DefaultSignalConfig(), AIMID: sampleAIMID, EvidenceURL: sampleEvidURL, Clock: fixedClock}
+		report, err := Run(t.Context(), strings.NewReader(input), sink, opts, nil)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(sink.batches) != 1 {
+			t.Fatalf("sink received %d batches, want 1", len(sink.batches))
+		}
+		return report, sink.batches[0].Body
+	}
+	original := sampleInput(t)
+	wantReport, wantBody := run(t, original)
+	tests := []struct {
+		name      string
+		move      func(line string) bool
+		wantMoved int
+	}{
+		{name: "every sandbox upgraded", move: everyLine, wantMoved: 6},
+		{name: "mixed fleet", move: func(line string) bool { return strings.Contains(line, sandboxAUID) }, wantMoved: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			input := moveSandboxToDevice(t, original, tt.move)
+			if got := strings.Count(input, `"device":{"container"`); got != tt.wantMoved {
+				t.Fatalf("moved %d records, want %d", got, tt.wantMoved)
+			}
+			report, body := run(t, input)
+			if !reflect.DeepEqual(report, wantReport) {
+				t.Fatalf("Report = %+v\nwant     %+v", report, wantReport)
+			}
+			if !bytes.Equal(body, wantBody) {
+				t.Fatalf("batch body differs:\n%s\nwant\n%s", body, wantBody)
+			}
+		})
+	}
+}
+
+// testdata/supervisor-device-container.jsonl holds unedited records from a
+// supervisor built at NVIDIA/OpenShell main 1cdfe70, the first shape that
+// carries the sandbox only in device.container.
+func TestRunUpstreamDeviceContainerCapture(t *testing.T) {
+	t.Parallel()
+	const (
+		captureSandboxUID  = "5fa11a3e-6497-4f23-aaf2-72749cb9a9f6"
+		captureSandboxName = "ans-54692"
+		captureRecords     = 14
+	)
+	capture, err := os.ReadFile(filepath.Join("testdata", "supervisor-device-container.jsonl"))
+	if err != nil {
+		t.Fatalf("read capture: %v", err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(capture)), "\n") {
+		var record struct {
+			Container json.RawMessage `json:"container"`
+			Device    struct {
+				Container *Container `json:"container"`
+			} `json:"device"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("capture line %d: %v", i+1, err)
+		}
+		if record.Container != nil || record.Device.Container == nil || record.Device.Container.UID != captureSandboxUID {
+			t.Fatalf("capture line %d is not the device.container shape: %s", i+1, line)
+		}
+	}
+	tests := []struct {
+		name    string
+		mapping AgentMapping
+	}{
+		{name: "mapped by uid", mapping: AgentMapping{AgentID: "agent-a", AnsName: "ans://v1.0.0.a.example.com", SandboxUIDs: []string{captureSandboxUID}}},
+		{name: "mapped by name", mapping: AgentMapping{AgentID: "agent-a", AnsName: "ans://v1.0.0.a.example.com", SandboxNames: []string{captureSandboxName}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			signals := DefaultSignalConfig()
+			signals.EmitActivity = true
+			sink := &fakeSink{}
+			opts := Options{Agents: mustAgentMap(t, tt.mapping), Signals: signals, AIMID: sampleAIMID, EvidenceURL: sampleEvidURL, Clock: fixedClock}
+			report, err := Run(t.Context(), bytes.NewReader(capture), sink, opts, nil)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if report.Parse.Events != captureRecords || report.Attributed != captureRecords || report.Unmapped != 0 || report.NoContainer != 0 {
+				t.Fatalf("Report = %+v, want all %d records attributed", report, captureRecords)
+			}
+			wantAgents := []AgentSummary{{AgentID: "agent-a", AnsName: "ans://v1.0.0.a.example.com", Events: captureRecords, Denied: 2, Observations: 3}}
+			if !reflect.DeepEqual(report.Agents, wantAgents) {
+				t.Fatalf("Agents = %+v, want %+v", report.Agents, wantAgents)
+			}
+			if !report.Posted || len(sink.batches) != 1 || len(sink.batches[0].Observations) != 3 {
+				t.Fatalf("Posted = %v, batches = %+v", report.Posted, sink.batches)
+			}
+		})
 	}
 }
 

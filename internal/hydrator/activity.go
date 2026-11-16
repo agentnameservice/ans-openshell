@@ -439,13 +439,14 @@ func (s *activityStats) policyChanged(policies []PolicyContext) bool {
 }
 
 func activitySandbox(ev Event) string {
-	if ev.Container == nil {
+	sandbox := ev.Sandbox()
+	if sandbox == nil {
 		return ""
 	}
-	if ev.Container.UID != "" {
-		return ev.Container.UID
+	if sandbox.UID != "" {
+		return sandbox.UID
 	}
-	return ev.Container.Name
+	return sandbox.Name
 }
 
 func boundedActivityText(s string) string {

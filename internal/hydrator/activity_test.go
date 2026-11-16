@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -225,6 +226,47 @@ func TestActivityPolicyBeforeWindow(t *testing.T) {
 	}
 	if len(report.Activity) != 1 || len(report.Activity[0].Policies) != 1 || report.Activity[0].Policies[0].Hash != "beforep1" {
 		t.Fatalf("pre-window policy context=%+v, want only the policy loaded before the window", report.Activity)
+	}
+}
+
+func TestActivityDeviceContainerShape(t *testing.T) {
+	t.Parallel()
+	window := Window{Start: time.UnixMilli(sampleBaseMs).UTC(), End: time.UnixMilli(sampleBaseMs + 60_000).UTC()}
+	policy := func(uid string, offsetMs int64) string {
+		return jsonLine(t, map[string]any{"class_uid": ClassDeviceConfigChange, "activity_id": 1, "time": sampleBaseMs + offsetMs, "container": map[string]any{"uid": sandboxAUID}, "metadata": map[string]any{"uid": uid}, "unmapped": map[string]any{"policy_hash": "hash-" + uid, "version": 1}})
+	}
+	original := strings.Join([]string{
+		policy("p1", -1000),
+		activityInput(t, "a1", "L7_REQUEST allow GET example.com:443/test reason=rule", 4002, 99, 1),
+		activityInput(t, "a2", "L7_REQUEST deny POST example.com:443/test reason=rule", 4002, 99, 2),
+		policy("p2", 1000),
+	}, "\n")
+	run := func(t *testing.T, input string) (Report, string) {
+		t.Helper()
+		opts := activityOptions(t)
+		opts.Window = &window
+		var evidence bytes.Buffer
+		opts.Evidence = &evidence
+		report, err := Run(t.Context(), strings.NewReader(input), &fakeSink{}, opts, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report, evidence.String()
+	}
+	wantReport, wantEvidence := run(t, original)
+	if len(wantReport.Activity) != 1 || len(wantReport.Activity[0].Policies) != 2 || wantReport.OutOfWindow != 1 {
+		t.Fatalf("baseline activity=%+v outOfWindow=%d, want one agent with both policies", wantReport.Activity, wantReport.OutOfWindow)
+	}
+	input := moveSandboxToDevice(t, original, everyLine)
+	if got := strings.Count(input, `"device":{"container"`); got != 4 {
+		t.Fatalf("moved %d records, want 4", got)
+	}
+	report, evidence := run(t, input)
+	if !reflect.DeepEqual(report, wantReport) {
+		t.Fatalf("Report = %+v\nwant     %+v", report, wantReport)
+	}
+	if evidence != wantEvidence {
+		t.Fatalf("evidence differs:\n%s\nwant\n%s", evidence, wantEvidence)
 	}
 }
 

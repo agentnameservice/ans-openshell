@@ -65,7 +65,7 @@ type Report struct {
 	// inside the window, whatever their class.
 	Attributed int
 	// Unmapped counts events that resolved to no agent; NoContainer is the
-	// subset that carried no container at all, as downgraded records do.
+	// subset that carried no sandbox at all (see Event.Sandbox).
 	Unmapped    int
 	NoContainer int
 	// OutOfWindow counts events excluded by an explicit Options.Window.

@@ -52,6 +52,16 @@ Run the tests:
 make cover
 ```
 
+Run the extension against a real OpenShell gateway, supervisor and sandbox on Docker. It
+downloads the pinned OpenShell release, mints disposable identity and trust material, and
+asserts that an authorized sandbox's plain request arrives signed, forged identity headers are
+replaced, an unapproved sandbox is denied, and a request is blocked while the middleware is
+down. See [examples/openshell-smoke](examples/openshell-smoke/README.md):
+
+```bash
+make openshell-smoke
+```
+
 ## Running the services
 
 Every service takes one YAML file. Flags: `--config` (required), `--listen` to override the

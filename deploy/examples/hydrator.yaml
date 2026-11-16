@@ -19,5 +19,5 @@ signing:                                                 # optional; signs each 
 agents:
   - agent_id: 7a4b2e91-83f6-4c12-9d58-bf1e6a3c9d07
     ans_name: ans://v1.0.0.payments.example.com
-    sandbox_names: [payments]            # container.name in the OCSF record
-    sandbox_uids: []                     # container.uid, the durable association
+    sandbox_names: [payments]            # device.container.name (container.name up to OpenShell v0.1.7)
+    sandbox_uids: []                     # device.container.uid, the durable association

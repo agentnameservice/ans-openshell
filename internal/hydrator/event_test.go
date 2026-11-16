@@ -315,6 +315,45 @@ func TestEventDenied(t *testing.T) {
 	}
 }
 
+func TestEventSandbox(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		record   string
+		wantUID  string
+		wantName string
+	}{
+		{name: "no sandbox", record: `{"class_uid":4001}`},
+		{name: "top-level container", record: `{"container":{"uid":"top","name":"top-name"}}`, wantUID: "top", wantName: "top-name"},
+		{name: "device container", record: `{"device":{"hostname":"h","container":{"uid":"dev","name":"dev-name"}}}`, wantUID: "dev", wantName: "dev-name"},
+		{name: "device container name only", record: `{"device":{"container":{"name":"dev-name"}}}`, wantName: "dev-name"},
+		{name: "device container wins", record: `{"device":{"container":{"uid":"dev"}},"container":{"uid":"top"}}`, wantUID: "dev"},
+		{name: "device without container falls back", record: `{"device":{"hostname":"h","type_id":99},"container":{"uid":"top"}}`, wantUID: "top"},
+		{name: "empty device container falls back", record: `{"device":{"container":{}},"container":{"uid":"top"}}`, wantUID: "top"},
+		{name: "empty device container alone", record: `{"device":{"container":{}}}`},
+		{name: "device identity is not the sandbox", record: `{"device":{"uid":"gateway-a","name":"gateway-a","hostname":"h"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ev, ok := decodeLine([]byte(tt.record))
+			if !ok {
+				t.Fatalf("decodeLine(%s) failed", tt.record)
+			}
+			got := ev.Sandbox()
+			if tt.wantUID == "" && tt.wantName == "" {
+				if got != nil {
+					t.Fatalf("Sandbox() = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil || got.UID != tt.wantUID || got.Name != tt.wantName {
+				t.Fatalf("Sandbox() = %+v, want uid %q name %q", got, tt.wantUID, tt.wantName)
+			}
+		})
+	}
+}
+
 func TestEventDestination(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
