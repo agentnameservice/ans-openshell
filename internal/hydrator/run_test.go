@@ -201,14 +201,14 @@ func TestRunDeviceContainerShape(t *testing.T) {
 	}
 }
 
-// testdata/supervisor-device-container.jsonl holds unedited records from a
-// supervisor built at NVIDIA/OpenShell main 1cdfe70, the first shape that
-// carries the sandbox only in device.container.
+// testdata/supervisor-device-container.jsonl holds unedited records from the
+// NVIDIA/OpenShell v0.1.8 supervisor, the first release that carries the
+// sandbox only in device.container.
 func TestRunUpstreamDeviceContainerCapture(t *testing.T) {
 	t.Parallel()
 	const (
-		captureSandboxUID  = "5fa11a3e-6497-4f23-aaf2-72749cb9a9f6"
-		captureSandboxName = "ans-54692"
+		captureSandboxUID  = "33374379-67e2-4df8-b078-2ddfeda8d24d"
+		captureSandboxName = "ans-74318"
 		captureRecords     = 14
 	)
 	capture, err := os.ReadFile(filepath.Join("testdata", "supervisor-device-container.jsonl"))
