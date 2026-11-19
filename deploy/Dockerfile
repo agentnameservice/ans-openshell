@@ -15,6 +15,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldfl
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG CMD=ans-openshell-middleware
 COPY --from=build /out/${CMD} /usr/local/bin/app
+COPY LICENSE NOTICE /usr/share/licenses/ans/
+COPY LICENSES/MIT.txt /usr/share/licenses/ans/LICENSES/MIT.txt
+COPY third_party/openshell/LICENSE third_party/openshell/README.md /usr/share/licenses/ans/third_party/openshell/
+LABEL org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/app"]
 CMD ["--config", "/etc/ans-openshell/config.yaml"]
