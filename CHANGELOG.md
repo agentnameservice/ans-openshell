@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.2](https://github.com/agentnameservice/ans-openshell/compare/v0.1.1...v0.1.2) (2026-11-19)
+
+
+### Features
+
+* **examples:** score the smoke run's behavior into a pinned Trust Index ([#27](https://github.com/agentnameservice/ans-openshell/issues/27)) ([3a2ac05](https://github.com/agentnameservice/ans-openshell/commit/3a2ac05d799b8244871d818effa3d60af75d76f6))
+
+
+### Bug Fixes
+
+* **hydrator:** read sandbox identity from device.container ([#24](https://github.com/agentnameservice/ans-openshell/issues/24)) ([b9ac477](https://github.com/agentnameservice/ans-openshell/commit/b9ac477c0b78c339395b297deededa80b311a34a)), closes [#23](https://github.com/agentnameservice/ans-openshell/issues/23)
+
+
+### Miscellaneous
+
+* adopt ANS governance and contribution licensing ([#14](https://github.com/agentnameservice/ans-openshell/issues/14)) ([421b913](https://github.com/agentnameservice/ans-openshell/commit/421b9133d278d4fc0784772e5e23a72332950bfa))
+* **deps:** Bump github.com/agentnameservice/ans-sdk-go ([#30](https://github.com/agentnameservice/ans-openshell/issues/30)) ([dc8339b](https://github.com/agentnameservice/ans-openshell/commit/dc8339b4a755f127958409bdb4faa8a95b19d8c9))
+* **deps:** Bump the actions-minor-patch group across 1 directory with 2 updates ([#32](https://github.com/agentnameservice/ans-openshell/issues/32)) ([f4dfdd9](https://github.com/agentnameservice/ans-openshell/commit/f4dfdd923fa22c588b5f9c7dc7e6758b22cbee5f))
+
 ## [0.1.1](https://github.com/agentnameservice/ans-openshell/compare/v0.1.0...v0.1.1) (2026-11-05)
 
 
