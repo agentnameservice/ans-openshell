@@ -178,7 +178,12 @@ the example leaves it unset.
   The evidence output keeps the refusal counts.
 - The score is rounded, so a single violation among 200 or more decisions still
   reports 100. The evidence output keeps the exact counts.
-- Rollout behavior (weight 0 has no effect on trust decisions, retained scores,
-  whole-batch rejection) belongs to the consumer and is not tested in this
-  repository. Verify it against the deployed `agent-trust-discovery` before
-  changing the weight.
+- Rollout behavior belongs to the consumer. `make openshell-smoke-trust-index`
+  exercises the registration from
+  [trust-index-score-signals.yaml](../deploy/examples/trust-index-score-signals.yaml),
+  the import, and the weight-0 state (the score is listed on the agent and the
+  behavior dimension stays 0) against the pinned `agent-trust-discovery` release
+  named in [trust-index-release.env](../examples/openshell-smoke/trust-index-release.env).
+  Retention of stale scores and whole-batch rejection are not exercised there;
+  verify both against the deployed `agent-trust-discovery` before changing the
+  weight.

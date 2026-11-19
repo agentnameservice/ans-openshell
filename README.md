@@ -62,6 +62,11 @@ down. See [examples/openshell-smoke](examples/openshell-smoke/README.md):
 make openshell-smoke
 ```
 
+`make openshell-smoke-trust-index` runs the same test and then scores the run's behavior: it
+enables OpenShell's OCSF export, feeds the supervisor's records through the hydrator into a pinned
+`agent-trust-discovery` release it downloads and runs, and checks the score on the agent's trust
+evaluation.
+
 ## Running the services
 
 Every service takes one YAML file. Flags: `--config` (required), `--listen` to override the
@@ -75,7 +80,9 @@ configured address, `--log-level` (`debug`, `info`, `warn`, `error`), `--log-for
 ```
 
 The hydrator is a batch job over the sandbox supervisors' OCSF records. Enable OpenShell's JSON
-export with `openshell settings set --global --key ocsf_json_enabled --value true`; each
+export with `openshell settings set --global --key ocsf_json_enabled --value true` (at a terminal
+the CLI asks you to confirm that a global value disables per-sandbox control of the key; pass
+`--yes` only where no terminal is attached); each
 supervisor then writes one `OCSF-JSON` line per event to its stderr and, where its `/var/log` is
 writable, to `/var/log/openshell-ocsf.<date>.jsonl` inside the supervisor container. Collect
 either with your log pipeline into a file the hydrator can read, one bare line per record: it
