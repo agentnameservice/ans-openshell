@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/agentnameservice/ans-openshell/compare/v0.1.2...v0.1.3) (2026-11-26)
+
+
+### Miscellaneous
+
+* **deps:** Bump actions/setup-go ([#33](https://github.com/agentnameservice/ans-openshell/issues/33)) ([2e27f15](https://github.com/agentnameservice/ans-openshell/commit/2e27f15da50e01ad28c8a158000e69a48617d643))
+
 ## [0.1.2](https://github.com/agentnameservice/ans-openshell/compare/v0.1.1...v0.1.2) (2026-11-19)
 
 
